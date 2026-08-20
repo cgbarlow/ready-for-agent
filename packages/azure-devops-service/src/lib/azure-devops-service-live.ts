@@ -14,6 +14,7 @@ import {
   AZURE_DEVOPS_FORGE_HOST,
   AZURE_DEVOPS_PAT_ENV_VAR,
   type AzureDevOpsProjectIdentity,
+  type AzureDevOpsReadyLabeledIssue,
   type AzureDevOpsRepository,
   splitAzureDevOpsProjectPath,
 } from "./types.js"
@@ -73,6 +74,153 @@ const PullRequestListSchema = Schema.Struct({
 const RepositoryMetaSchema = Schema.Struct({
   defaultBranch: Schema.optional(Schema.NullOr(Schema.String)),
 })
+
+/** Semaphore for Ready Work Items, mirrors GitHub/GitLab's `ready-for-agent` label. */
+const READY_FOR_AGENT_TAG = "ready-for-agent"
+
+/**
+ * `System.LinkTypes.Dependency-Reverse` is the "Predecessor" end of a
+ * Successor-Predecessor link: the linked work item must complete before this
+ * one, i.e. it blocks this one. The forward end
+ * (`System.LinkTypes.Dependency-Forward`, "Successor") is the opposite
+ * direction and is never surfaced as `blockedBy`.
+ */
+const PREDECESSOR_LINK_TYPE = "System.LinkTypes.Dependency-Reverse"
+
+/**
+ * Work item states treated as closed for Ready Issue / blocking purposes.
+ * Azure DevOps has no fixed closed-state name across process templates
+ * (Agile: Closed, Scrum: Done/Removed, CMMI: Closed), so this is a
+ * heuristic over the common default templates rather than a per-project
+ * `workitemtypes/{type}/states` lookup (out of scope for this ticket).
+ */
+const CLOSED_STATE_NAMES = new Set([
+  "closed",
+  "done",
+  "removed",
+  "resolved",
+  "completed",
+])
+
+const isOpenState = (state: string | undefined): boolean =>
+  state === undefined
+    ? true
+    : !CLOSED_STATE_NAMES.has(state.trim().toLowerCase())
+
+const toIssueState = (state: string | undefined): "OPEN" | "CLOSED" =>
+  isOpenState(state) ? "OPEN" : "CLOSED"
+
+const IdentityRefSchema = Schema.Struct({
+  displayName: Schema.optional(Schema.NullOr(Schema.String)),
+  uniqueName: Schema.optional(Schema.NullOr(Schema.String)),
+})
+
+const identityDisplayName = (
+  identity: typeof IdentityRefSchema.Type | undefined,
+): string | null => {
+  if (identity === undefined) return null
+  const displayName = identity.displayName?.trim()
+  if (displayName !== undefined && displayName !== "") return displayName
+  const uniqueName = identity.uniqueName?.trim()
+  if (uniqueName !== undefined && uniqueName !== "") return uniqueName
+  return null
+}
+
+const WorkItemRelationSchema = Schema.Struct({
+  rel: RequiredString,
+  url: RequiredString,
+})
+
+const WorkItemFieldsSchema = Schema.Struct({
+  "System.Title": Schema.optional(Schema.String),
+  "System.Description": Schema.optional(Schema.NullOr(Schema.String)),
+  "System.State": Schema.optional(Schema.String),
+  "System.CreatedDate": Schema.optional(Schema.String),
+  "System.CreatedBy": Schema.optional(IdentityRefSchema),
+})
+
+const WorkItemSchema = Schema.Struct({
+  id: Schema.Int,
+  fields: WorkItemFieldsSchema,
+  relations: Schema.optional(Schema.Array(WorkItemRelationSchema)),
+})
+type AzureDevOpsWorkItem = typeof WorkItemSchema.Type
+
+const WorkItemBatchSchema = Schema.Struct({
+  value: Schema.Array(WorkItemSchema),
+})
+
+const WiqlWorkItemRefSchema = Schema.Struct({ id: Schema.Int })
+const WiqlResultSchema = Schema.Struct({
+  workItems: Schema.optional(Schema.Array(WiqlWorkItemRefSchema)),
+})
+
+/** Max work item ids per `_apis/wit/workitems` batch GET (API limit is 200). */
+const WORK_ITEM_BATCH_SIZE = 200
+
+const chunk = <T>(items: readonly T[], size: number): T[][] => {
+  const chunks: T[][] = []
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size))
+  }
+  return chunks
+}
+
+const readyForAgentWiqlQuery = (): string =>
+  `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project AND [System.Tags] CONTAINS '${READY_FOR_AGENT_TAG}' ORDER BY [System.Id]`
+
+const workItemUrl = (
+  identity: AzureDevOpsProjectIdentity,
+  id: number,
+): string =>
+  `https://${AZURE_DEVOPS_FORGE_HOST}/${encodeURIComponent(identity.organization)}/${encodeURIComponent(identity.project)}/_workitems/edit/${id}`
+
+/** Extract the numeric work item id from a relation's `.../workItems/{id}` URL. */
+const workItemIdFromRelationUrl = (url: string): number | null => {
+  const match = /\/workItems\/(\d+)$/i.exec(url)
+  if (match === null) return null
+  const id = Number(match[1])
+  return Number.isSafeInteger(id) ? id : null
+}
+
+const toReadyLabeledIssue = (
+  identity: AzureDevOpsProjectIdentity,
+  item: AzureDevOpsWorkItem,
+  stateById: ReadonlyMap<number, string | undefined>,
+): AzureDevOpsReadyLabeledIssue => {
+  const fields = item.fields
+  const createdAt = new Date(fields["System.CreatedDate"] ?? "")
+  if (Number.isNaN(createdAt.getTime())) {
+    throw new Error(
+      `Invalid Azure DevOps work item creation time: ${String(fields["System.CreatedDate"])}`,
+    )
+  }
+  const blockerIds = new Set(
+    (item.relations ?? [])
+      .filter((relation) => relation.rel === PREDECESSOR_LINK_TYPE)
+      .map((relation) => workItemIdFromRelationUrl(relation.url))
+      .filter((id): id is number => id !== null),
+  )
+  const blockedBy = [...blockerIds]
+    .filter((id) => isOpenState(stateById.get(id)))
+    .sort((left, right) => left - right)
+    .map((id) => ({ number: id, url: workItemUrl(identity, id) }))
+  return {
+    number: item.id,
+    title: fields["System.Title"] ?? "",
+    body: fields["System.Description"] ?? "",
+    url: workItemUrl(identity, item.id),
+    createdAt,
+    state: toIssueState(fields["System.State"]),
+    author: identityDisplayName(fields["System.CreatedBy"]),
+    parent: null,
+    parentPosition: null,
+    hasChildren: false,
+    hierarchySupported: false,
+    blockedBy,
+    closingPullRequests: [],
+  } satisfies AzureDevOpsReadyLabeledIssue
+}
 
 const decode = <S extends { readonly Type: unknown }>(
   schema: S & Parameters<typeof Schema.decodeUnknownSync>[0],
@@ -188,6 +336,35 @@ export const makeAzureDevOpsService = (options: {
         Effect.fail(requestError(`${message} timed out`, cause)),
       ),
     )
+
+  /**
+   * Batch-fetch work items with all fields and relations
+   * (`$expand=all`) for the given ids, chunked to the API's per-request
+   * limit. `errorPolicy=Omit` so a deleted/inaccessible id (e.g. a stale
+   * Predecessor link target) drops that item instead of failing the whole
+   * batch.
+   */
+  const fetchWorkItemsWithRelations = (
+    organization: string,
+    ids: readonly number[],
+  ): Effect.Effect<readonly AzureDevOpsWorkItem[], AzureDevOpsRequestError> =>
+    Effect.gen(function* () {
+      const results: AzureDevOpsWorkItem[] = []
+      for (const batch of chunk(ids, WORK_ITEM_BATCH_SIZE)) {
+        const value = yield* requestUnknown(
+          organization,
+          `/_apis/wit/workitems?ids=${batch.join(",")}&$expand=all&errorPolicy=Omit`,
+          `Failed to load Azure DevOps work items ${batch.join(",")}`,
+        )
+        const decoded = yield* Effect.try({
+          try: () => decode(WorkItemBatchSchema, value),
+          catch: (cause) =>
+            requestError("Azure DevOps returned invalid work item data", cause),
+        })
+        results.push(...decoded.value)
+      }
+      return results
+    })
 
   const unavailableOn404 = <A>(
     repository: AzureDevOpsRepository,
@@ -352,7 +529,70 @@ export const makeAzureDevOpsService = (options: {
         connectionData,
       )
     }),
-    listReadyIssues: () => notImplemented("listReadyIssues"),
+    listReadyIssues: Effect.fn("AzureDevOpsService.listReadyIssues")(
+      function* (repository) {
+        const identity = splitAzureDevOpsProjectPath(repository.projectPath)
+        if (identity === null) {
+          return yield* invalidProjectPath(repository)
+        }
+        const wiqlValue = yield* unavailableOn404(
+          repository,
+          requestUnknown(
+            identity.organization,
+            `/${encodeURIComponent(identity.project)}/_apis/wit/wiql`,
+            `Failed to list Ready Issues for ${repository.projectPath}`,
+            { method: "POST", body: { query: readyForAgentWiqlQuery() } },
+          ),
+        )
+        const wiql = yield* Effect.try({
+          try: () => decode(WiqlResultSchema, wiqlValue),
+          catch: (cause) =>
+            requestError("Azure DevOps returned an invalid WIQL result", cause),
+        })
+        const ids = (wiql.workItems ?? []).map((item) => item.id)
+        if (ids.length === 0) return []
+
+        const items = yield* unavailableOn404(
+          repository,
+          fetchWorkItemsWithRelations(identity.organization, ids),
+        )
+        const knownIds = new Set(items.map((item) => item.id))
+        const blockerIds = new Set<number>()
+        for (const item of items) {
+          for (const relation of item.relations ?? []) {
+            if (relation.rel !== PREDECESSOR_LINK_TYPE) continue
+            const blockerId = workItemIdFromRelationUrl(relation.url)
+            if (blockerId !== null) blockerIds.add(blockerId)
+          }
+        }
+        const missingBlockerIds = [...blockerIds].filter(
+          (id) => !knownIds.has(id),
+        )
+        const blockerItems =
+          missingBlockerIds.length === 0
+            ? []
+            : yield* unavailableOn404(
+                repository,
+                fetchWorkItemsWithRelations(
+                  identity.organization,
+                  missingBlockerIds,
+                ),
+              )
+        const stateById = new Map<number, string | undefined>()
+        for (const item of [...items, ...blockerItems]) {
+          stateById.set(item.id, item.fields["System.State"])
+        }
+
+        return yield* Effect.try({
+          try: () =>
+            items
+              .map((item) => toReadyLabeledIssue(identity, item, stateById))
+              .sort((left, right) => left.number - right.number),
+          catch: (cause) =>
+            requestError("Azure DevOps returned invalid work item data", cause),
+        })
+      },
+    ),
     hasCredentials: () => Effect.succeed(options.token !== undefined),
     hasAmbientCredentials: () => Effect.succeed(options.token !== undefined),
     getOpenPullRequestNumber: Effect.fn(

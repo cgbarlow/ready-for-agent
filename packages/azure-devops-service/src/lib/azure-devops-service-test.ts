@@ -5,10 +5,13 @@ import {
   AzureDevOpsProjectUnavailableError,
   AzureDevOpsRequestError,
 } from "./errors.js"
-import type { AzureDevOpsRepository } from "./types.js"
+import type {
+  AzureDevOpsReadyLabeledIssue,
+  AzureDevOpsRepository,
+} from "./types.js"
 
 /**
- * Hand-written fake for the nine Azure DevOps service methods implemented
+ * Hand-written fake for the ten Azure DevOps service methods implemented
  * against the real REST API today. Mirrors
  * `gitlab-service-test.ts`'s in-memory `Map`-keyed `Layer.succeed` pattern:
  * no HTTP mocking library. Every other method fails with
@@ -18,6 +21,14 @@ import type { AzureDevOpsRepository } from "./types.js"
  */
 export interface AzureDevOpsServiceTestFixture {
   readonly repository: AzureDevOpsRepository
+  /**
+   * `listReadyIssues` fixture. Populate `blockedBy` on individual issues to
+   * exercise blocking-link behavior against the fake (the live layer's WIQL
+   * + `System.LinkTypes.Dependency-Reverse` reads that produce this same
+   * shape are covered separately, against a fake `fetch`, in
+   * `test/azure-devops-service.spec.ts`).
+   */
+  readonly issues?: readonly AzureDevOpsReadyLabeledIssue[]
   readonly operatorLogin?: string
   readonly hasCredentials?: boolean
   /** Open pull request number keyed by exact source branch. */
@@ -89,7 +100,14 @@ export const makeAzureDevOpsServiceTest = (
         state !== undefined && (state.fixture.hasCredentials ?? true),
       )
     },
-    listReadyIssues: notImplemented("listReadyIssues"),
+    listReadyIssues: (repository) =>
+      failOr(repository, (state) =>
+        Effect.succeed(
+          [...(state.fixture.issues ?? [])].sort(
+            (left, right) => left.number - right.number,
+          ),
+        ),
+      ),
     getOpenPullRequestNumber: (repository, headRefName) => {
       const state = stateFor(repository)
       if (state === undefined) {
