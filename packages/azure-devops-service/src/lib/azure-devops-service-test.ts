@@ -1,4 +1,9 @@
 import { Effect, Layer } from "effect"
+import type {
+  MergePullRequestResult,
+  PullRequestCheckStatus,
+  PullRequestLifecycleStatus,
+} from "@ready-for-agent/github-service"
 import { AzureDevOpsService } from "./azure-devops-service.js"
 import {
   AzureDevOpsNotImplementedError,
@@ -11,10 +16,11 @@ import type {
 } from "./types.js"
 
 /**
- * Hand-written fake for the ten Azure DevOps service methods implemented
+ * Hand-written fake for the 16 Azure DevOps service methods implemented
  * against the real REST API today. Mirrors
  * `gitlab-service-test.ts`'s in-memory `Map`-keyed `Layer.succeed` pattern:
- * no HTTP mocking library. Every other method fails with
+ * no HTTP mocking library. Every other method (only
+ * `countOpenNonDraftPullRequests` remains) fails with
  * `AzureDevOpsNotImplementedError`, matching the live layer, so callers
  * exercising unimplemented methods against this fake see the same error they
  * would see against `AzureDevOpsServiceLive`.
@@ -33,6 +39,9 @@ export interface AzureDevOpsServiceTestFixture {
   readonly hasCredentials?: boolean
   /** Open pull request number keyed by exact source branch. */
   readonly openPullRequestByBranch?: Readonly<Record<string, number>>
+  readonly pullRequestCheckStatus?: PullRequestCheckStatus
+  readonly pullRequestLifecycleStatus?: PullRequestLifecycleStatus
+  readonly mergePullRequestResult?: MergePullRequestResult
   readonly error?: AzureDevOpsRequestError
 }
 
@@ -144,20 +153,43 @@ export const makeAzureDevOpsServiceTest = (
     countOpenNonDraftPullRequests: notImplemented(
       "countOpenNonDraftPullRequests",
     ),
-    getPullRequestCheckStatus: notImplemented("getPullRequestCheckStatus"),
-    getPrStatusCheckDiagnostics: notImplemented("getPrStatusCheckDiagnostics"),
+    getPullRequestCheckStatus: (repository) =>
+      failOr(repository, (state) =>
+        Effect.succeed(
+          state.fixture.pullRequestCheckStatus ?? {
+            _tag: "succeeded" as const,
+            terminalChecks: [],
+            mergeability: "mergeable" as const,
+            baseRefName: "main",
+            headPushedAt: null,
+            headSha: null,
+            createdAt: null,
+            isDraft: null,
+          },
+        ),
+      ),
+    getPrStatusCheckDiagnostics: (repository) =>
+      failOr(repository, () => Effect.succeed([])),
     markPullRequestReadyForReview: (repository) =>
       failOr(repository, () => Effect.void),
-    getPullRequestLifecycleStatus: notImplemented(
-      "getPullRequestLifecycleStatus",
-    ),
-    mergePullRequest: notImplemented("mergePullRequest"),
-    ensureIssueCompletedWithSummary: notImplemented(
-      "ensureIssueCompletedWithSummary",
-    ),
-    closeOpenPullRequestsForBranch: notImplemented(
-      "closeOpenPullRequestsForBranch",
-    ),
-    deleteBranch: notImplemented("deleteBranch"),
+    getPullRequestLifecycleStatus: (repository) =>
+      failOr(repository, (state) =>
+        Effect.succeed(
+          state.fixture.pullRequestLifecycleStatus ??
+            ({ _tag: "open" } satisfies PullRequestLifecycleStatus),
+        ),
+      ),
+    mergePullRequest: (repository) =>
+      failOr(repository, (state) =>
+        Effect.succeed(
+          state.fixture.mergePullRequestResult ??
+            ({ _tag: "merged" } satisfies MergePullRequestResult),
+        ),
+      ),
+    ensureIssueCompletedWithSummary: (repository) =>
+      failOr(repository, () => Effect.void),
+    closeOpenPullRequestsForBranch: (repository) =>
+      failOr(repository, () => Effect.void),
+    deleteBranch: (repository) => failOr(repository, () => Effect.void),
   })
 }

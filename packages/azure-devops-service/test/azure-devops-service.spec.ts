@@ -383,43 +383,8 @@ describe("Azure DevOps not-yet-implemented methods", () => {
         method: "countOpenNonDraftPullRequests",
         run: () => service.countOpenNonDraftPullRequests(repository),
       },
-      {
-        method: "getPullRequestCheckStatus",
-        run: () => service.getPullRequestCheckStatus(repository, "feature"),
-      },
-      {
-        method: "getPrStatusCheckDiagnostics",
-        run: () => service.getPrStatusCheckDiagnostics(repository, []),
-      },
-      {
-        method: "getPullRequestLifecycleStatus",
-        run: () => service.getPullRequestLifecycleStatus(repository, "feature"),
-      },
-      {
-        method: "mergePullRequest",
-        run: () => service.mergePullRequest(repository, "feature"),
-      },
-      {
-        method: "ensureIssueCompletedWithSummary",
-        run: () =>
-          service.ensureIssueCompletedWithSummary(
-            repository,
-            1,
-            "wi-1",
-            "summary",
-          ),
-      },
-      {
-        method: "closeOpenPullRequestsForBranch",
-        run: () =>
-          service.closeOpenPullRequestsForBranch(repository, "feature"),
-      },
-      {
-        method: "deleteBranch",
-        run: () => service.deleteBranch(repository, "feature"),
-      },
     ]
-    expect(cases).toHaveLength(8)
+    expect(cases).toHaveLength(1)
     for (const { method, run } of cases) {
       const error = await Effect.runPromise(run().pipe(Effect.flip))
       expect(error).toBeInstanceOf(AzureDevOpsNotImplementedError)
@@ -427,6 +392,714 @@ describe("Azure DevOps not-yet-implemented methods", () => {
         expect(error.method).toBe(method)
       }
     }
+  })
+})
+
+const activePullRequestListPath =
+  "/acme/widgets/_apis/git/repositories/widgets/pullrequests?searchCriteria.status=active&searchCriteria.sourceRefName=refs%2Fheads%2Ffeature&api-version=7.1"
+const allPullRequestListPath =
+  "/acme/widgets/_apis/git/repositories/widgets/pullrequests?searchCriteria.status=all&searchCriteria.sourceRefName=refs%2Fheads%2Ffeature&api-version=7.1"
+
+describe("Azure DevOps getPullRequestCheckStatus", () => {
+  test("reports pending when no pull request is yet visible for the branch", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: { value: [] },
+        [allPullRequestListPath]: { value: [] },
+      }),
+    )
+    await expect(
+      Effect.runPromise(
+        service.getPullRequestCheckStatus(repository, "feature"),
+      ),
+    ).resolves.toEqual({
+      _tag: "pending",
+      terminalChecks: [],
+      mergeability: "unknown",
+      baseRefName: null,
+      headPushedAt: null,
+      headSha: null,
+      createdAt: null,
+      isDraft: null,
+    })
+  })
+
+  test("maps non-conflict mergeStatus values (failure, rejectedByPolicy, queued, notSet) to unknown", async () => {
+    for (const mergeStatus of [
+      "failure",
+      "rejectedByPolicy",
+      "queued",
+      "notSet",
+    ]) {
+      const service = makeAzureDevOpsServiceFromToken(
+        "test-pat",
+        fakeFetch({
+          [activePullRequestListPath]: {
+            value: [
+              {
+                pullRequestId: 42,
+                status: "active",
+                isDraft: false,
+                mergeStatus,
+                lastMergeSourceCommit: { commitId: "abc123" },
+              },
+            ],
+          },
+          "/acme/widgets/_apis/git/repositories/widgets/pullrequests/42/statuses?api-version=7.1":
+            { value: [] },
+          "/acme/widgets/_apis/git/repositories/widgets/commits/abc123?api-version=7.1":
+            new Response("not found", { status: 404 }),
+        }),
+      )
+      const status = await Effect.runPromise(
+        service.getPullRequestCheckStatus(repository, "feature"),
+      )
+      expect(status.mergeability).toBe("unknown")
+    }
+  })
+
+  test("maps mergeStatus conflicts to conflicting mergeability", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: {
+          value: [
+            {
+              pullRequestId: 42,
+              status: "active",
+              isDraft: false,
+              mergeStatus: "conflicts",
+              lastMergeSourceCommit: { commitId: "abc123" },
+            },
+          ],
+        },
+        "/acme/widgets/_apis/git/repositories/widgets/pullrequests/42/statuses?api-version=7.1":
+          { value: [] },
+        "/acme/widgets/_apis/git/repositories/widgets/commits/abc123?api-version=7.1":
+          new Response("not found", { status: 404 }),
+      }),
+    )
+    const status = await Effect.runPromise(
+      service.getPullRequestCheckStatus(repository, "feature"),
+    )
+    expect(status.mergeability).toBe("conflicting")
+  })
+
+  test("aggregates a red policy evaluation and a red status as failed", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: {
+          value: [
+            {
+              pullRequestId: 42,
+              status: "active",
+              isDraft: false,
+              targetRefName: "refs/heads/main",
+              mergeStatus: "succeeded",
+              lastMergeSourceCommit: { commitId: "abc123" },
+              creationDate: "2026-01-01T00:00:00Z",
+              repository: { project: { id: "proj-1" } },
+            },
+          ],
+        },
+        "/acme/widgets/_apis/policy/evaluations?artifactId=vstfs%3A%2F%2F%2FCodeReview%2FCodeReviewId%2Fproj-1%2F42&api-version=7.1":
+          {
+            value: [
+              {
+                evaluationId: "eval-1",
+                status: "rejected",
+                configuration: { type: { displayName: "Build validation" } },
+              },
+            ],
+          },
+        "/acme/widgets/_apis/git/repositories/widgets/pullrequests/42/statuses?api-version=7.1":
+          {
+            value: [
+              {
+                id: 7,
+                state: "failed",
+                context: { name: "lint", genre: "ci" },
+              },
+            ],
+          },
+        "/acme/widgets/_apis/git/repositories/widgets/commits/abc123?api-version=7.1":
+          { committer: { date: "2026-01-02T00:00:00Z" } },
+      }),
+    )
+    const status = await Effect.runPromise(
+      service.getPullRequestCheckStatus(repository, "feature"),
+    )
+    expect(status._tag).toBe("failed")
+    expect(status.mergeability).toBe("mergeable")
+    expect(status.headSha).toBe("abc123")
+    expect(status.baseRefName).toBe("main")
+    if (status._tag === "failed") {
+      expect(status.terminalChecks).toEqual([
+        {
+          externalId: "azure-policy:eval-1",
+          name: "Build validation",
+          outcome: "red",
+        },
+        { externalId: "azure-status:7", name: "ci/lint", outcome: "red" },
+      ])
+    }
+  })
+
+  test("reports succeeded and forces mergeable when the pull request is completed", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: {
+          value: [
+            {
+              pullRequestId: 42,
+              status: "completed",
+              isDraft: false,
+              mergeStatus: "conflicts",
+              lastMergeSourceCommit: { commitId: "abc123" },
+            },
+          ],
+        },
+        "/acme/widgets/_apis/git/repositories/widgets/commits/abc123?api-version=7.1":
+          new Response("not found", { status: 404 }),
+      }),
+    )
+    const status = await Effect.runPromise(
+      service.getPullRequestCheckStatus(repository, "feature"),
+    )
+    expect(status._tag).toBe("succeeded")
+    expect(status.mergeability).toBe("mergeable")
+  })
+
+  test("reports closed when the pull request was abandoned", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: {
+          value: [{ pullRequestId: 42, status: "abandoned", isDraft: false }],
+        },
+      }),
+    )
+    const status = await Effect.runPromise(
+      service.getPullRequestCheckStatus(repository, "feature"),
+    )
+    expect(status._tag).toBe("closed")
+  })
+})
+
+describe("Azure DevOps getPrStatusCheckDiagnostics", () => {
+  test("loads a build log excerpt for a red policy evaluation", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        "/acme/widgets/_apis/policy/evaluations/eval-1?api-version=7.1": {
+          evaluationId: "eval-1",
+          status: "rejected",
+          context: { buildId: 99 },
+        },
+        "/acme/widgets/_apis/build/builds/99/logs?api-version=7.1": {
+          value: [{ id: 1 }, { id: 2 }],
+        },
+        "/acme/widgets/_apis/build/builds/99/logs/2?api-version=7.1":
+          new Response("line one\nline two", {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          }),
+      }),
+    )
+    const diagnostics = await Effect.runPromise(
+      service.getPrStatusCheckDiagnostics(repository, [
+        { externalId: "azure-policy:eval-1", name: "Build validation" },
+      ]),
+    )
+    expect(diagnostics).toHaveLength(1)
+    expect(diagnostics[0]?.source).toBe("azure-policy")
+    expect(diagnostics[0]?.htmlUrl).toBe(
+      "https://dev.azure.com/acme/widgets/_build/results?buildId=99",
+    )
+    expect(diagnostics[0]?.logFetch).toEqual({
+      _tag: "ok",
+      excerpt: "line one\nline two",
+      localPath: null,
+    })
+  })
+
+  test("reports unavailable for an azure-status check (no log content)", async () => {
+    const service = makeAzureDevOpsServiceFromToken("test-pat", fetch)
+    const diagnostics = await Effect.runPromise(
+      service.getPrStatusCheckDiagnostics(repository, [
+        { externalId: "azure-status:7", name: "ci/lint" },
+      ]),
+    )
+    expect(diagnostics).toEqual([
+      {
+        externalId: "azure-status:7",
+        name: "ci/lint",
+        source: "azure-status",
+        htmlUrl: null,
+        logFetch: {
+          _tag: "unavailable",
+          reason:
+            "Azure DevOps does not expose log content for pull request statuses",
+        },
+      },
+    ])
+  })
+})
+
+describe("Azure DevOps getPullRequestLifecycleStatus", () => {
+  test("reports not_found when no pull request exists", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: { value: [] },
+        [allPullRequestListPath]: { value: [] },
+      }),
+    )
+    await expect(
+      Effect.runPromise(
+        service.getPullRequestLifecycleStatus(repository, "feature"),
+      ),
+    ).resolves.toEqual({ _tag: "not_found" })
+  })
+
+  test("reports merged, closed, and open", async () => {
+    for (const [status, expected] of [
+      ["completed", "merged"],
+      ["abandoned", "closed"],
+      ["active", "open"],
+    ] as const) {
+      const service = makeAzureDevOpsServiceFromToken(
+        "test-pat",
+        fakeFetch({
+          [activePullRequestListPath]: {
+            value: [{ pullRequestId: 1, status, isDraft: false }],
+          },
+        }),
+      )
+      await expect(
+        Effect.runPromise(
+          service.getPullRequestLifecycleStatus(repository, "feature"),
+        ),
+      ).resolves.toEqual({ _tag: expected })
+    }
+  })
+})
+
+describe("Azure DevOps mergePullRequest", () => {
+  test("merges a ready pull request", async () => {
+    let patchBody: unknown = null
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "PATCH") {
+        patchBody = JSON.parse(String(init?.body))
+        return json({ pullRequestId: 42, status: "completed" })
+      }
+      if (url.pathname.endsWith("/statuses")) {
+        return json({ value: [] })
+      }
+      if (url.pathname.includes("/policy/evaluations")) {
+        return json({ value: [{ evaluationId: "e1", status: "approved" }] })
+      }
+      return json({
+        value: [
+          {
+            pullRequestId: 42,
+            status: "active",
+            isDraft: false,
+            mergeStatus: "succeeded",
+            lastMergeSourceCommit: { commitId: "sha-1" },
+            repository: { project: { id: "proj-1" } },
+          },
+        ],
+      })
+    }) as unknown as typeof fetch)
+
+    const result = await Effect.runPromise(
+      service.mergePullRequest(repository, "feature"),
+    )
+    expect(result).toEqual({ _tag: "merged" })
+    expect(patchBody).toEqual({
+      status: "completed",
+      lastMergeSourceCommit: { commitId: "sha-1" },
+    })
+  })
+
+  test("re-fetches and reclassifies after a 422 merge precondition rejection", async () => {
+    let patchAttempts = 0
+    let pullRequestListCalls = 0
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "PATCH") {
+        patchAttempts += 1
+        return new Response("policy not yet satisfied", { status: 422 })
+      }
+      if (url.pathname.endsWith("/statuses")) {
+        return json({ value: [] })
+      }
+      if (url.pathname.includes("/policy/evaluations")) {
+        return json({ value: [{ evaluationId: "e1", status: "approved" }] })
+      }
+      pullRequestListCalls += 1
+      // First classify sees an active, ready-to-merge PR; the post-422
+      // re-fetch sees it already completed (merged concurrently elsewhere
+      // while the policy precondition was being resolved).
+      const status = pullRequestListCalls === 1 ? "active" : "completed"
+      return json({
+        value: [
+          {
+            pullRequestId: 42,
+            status,
+            isDraft: false,
+            mergeStatus: "succeeded",
+            lastMergeSourceCommit: { commitId: "sha-1" },
+            repository: { project: { id: "proj-1" } },
+          },
+        ],
+      })
+    }) as unknown as typeof fetch)
+
+    const result = await Effect.runPromise(
+      service.mergePullRequest(repository, "feature"),
+    )
+    expect(result).toEqual({ _tag: "merged" })
+    expect(patchAttempts).toBe(1)
+    expect(pullRequestListCalls).toBe(2)
+  })
+
+  test("reports needs_human missing_successful_checks with no green checks", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: {
+          value: [
+            {
+              pullRequestId: 42,
+              status: "active",
+              isDraft: false,
+              mergeStatus: "succeeded",
+              lastMergeSourceCommit: { commitId: "sha-1" },
+            },
+          ],
+        },
+        "/acme/widgets/_apis/git/repositories/widgets/pullrequests/42/statuses?api-version=7.1":
+          { value: [] },
+      }),
+    )
+    const result = await Effect.runPromise(
+      service.mergePullRequest(repository, "feature"),
+    )
+    expect(result).toEqual({
+      _tag: "needs_human",
+      reason: "missing_successful_checks",
+      message:
+        "No successful build validation / branch policy checks were reported for acme/widgets:feature",
+    })
+  })
+
+  test("reports needs_human closed_unmerged when the pull request was abandoned", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: {
+          value: [{ pullRequestId: 42, status: "abandoned", isDraft: false }],
+        },
+      }),
+    )
+    const result = await Effect.runPromise(
+      service.mergePullRequest(repository, "feature"),
+    )
+    expect(result).toEqual({
+      _tag: "needs_human",
+      reason: "closed_unmerged",
+      message:
+        "Pull request for acme/widgets:feature was closed without merging",
+    })
+  })
+
+  test("fails when no pull request exists for the branch", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [activePullRequestListPath]: { value: [] },
+        [allPullRequestListPath]: { value: [] },
+      }),
+    )
+    const error = await Effect.runPromise(
+      service.mergePullRequest(repository, "feature").pipe(Effect.flip),
+    )
+    expect(error).toBeInstanceOf(AzureDevOpsRequestError)
+  })
+})
+
+describe("Azure DevOps ensureIssueCompletedWithSummary", () => {
+  test("posts a marked summary comment and closes the work item", async () => {
+    let postedComment: unknown = null
+    let patchBody: unknown = null
+    const commentApiVersions: string[] = []
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (url.pathname.endsWith("/comments")) {
+        commentApiVersions.push(url.searchParams.get("api-version") ?? "")
+        if (method === "POST") {
+          postedComment = JSON.parse(String(init?.body))
+          return json({ text: (postedComment as { text: string }).text })
+        }
+        return json({ comments: [] })
+      }
+      if (url.pathname.endsWith("/states")) {
+        return json({
+          value: [
+            { name: "Active", category: "InProgress" },
+            { name: "Closed", category: "Completed" },
+          ],
+        })
+      }
+      if (method === "PATCH") {
+        patchBody = JSON.parse(String(init?.body))
+        return json({
+          id: 1,
+          fields: { "System.State": "Closed" },
+        })
+      }
+      return json({
+        id: 1,
+        fields: { "System.State": "Active", "System.WorkItemType": "Task" },
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(
+      service.ensureIssueCompletedWithSummary(
+        repository,
+        1,
+        "wi-1",
+        "All done",
+      ),
+    )
+    expect(postedComment).toEqual({
+      text: "All done\n\n<!-- ready-for-agent:work-item:wi-1 -->",
+    })
+    expect(patchBody).toEqual([
+      { op: "add", path: "/fields/System.State", value: "Closed" },
+    ])
+    // The comments surface is preview-only on this API; the GA "7.1" version
+    // has no comments endpoint.
+    expect(commentApiVersions).toEqual(["7.1-preview.3", "7.1-preview.3"])
+  })
+
+  test("falls back to the literal Closed state when the type-states lookup fails", async () => {
+    let patchBody: unknown = null
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (url.pathname.endsWith("/comments")) {
+        if (method === "POST") {
+          const posted = JSON.parse(String(init?.body)) as { text: string }
+          return json({ text: posted.text })
+        }
+        return json({ comments: [] })
+      }
+      if (url.pathname.endsWith("/states")) {
+        return new Response("not found", { status: 404 })
+      }
+      if (method === "PATCH") {
+        patchBody = JSON.parse(String(init?.body))
+        return json({
+          id: 1,
+          fields: { "System.State": "Closed" },
+        })
+      }
+      return json({
+        id: 1,
+        fields: { "System.State": "Active", "System.WorkItemType": "Task" },
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(
+      service.ensureIssueCompletedWithSummary(
+        repository,
+        1,
+        "wi-1",
+        "All done",
+      ),
+    )
+    expect(patchBody).toEqual([
+      { op: "add", path: "/fields/System.State", value: "Closed" },
+    ])
+  })
+
+  test("falls back to the literal Closed state when the type-states response fails to decode", async () => {
+    let patchBody: unknown = null
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (url.pathname.endsWith("/comments")) {
+        if (method === "POST") {
+          const posted = JSON.parse(String(init?.body)) as { text: string }
+          return json({ text: posted.text })
+        }
+        return json({ comments: [] })
+      }
+      if (url.pathname.endsWith("/states")) {
+        // Schema-invalid body (missing the required "value" array): must not
+        // crash the close-out as an unhandled defect; falls back like a 404.
+        return json({ notValue: [] })
+      }
+      if (method === "PATCH") {
+        patchBody = JSON.parse(String(init?.body))
+        return json({
+          id: 1,
+          fields: { "System.State": "Closed" },
+        })
+      }
+      return json({
+        id: 1,
+        fields: { "System.State": "Active", "System.WorkItemType": "Task" },
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(
+      service.ensureIssueCompletedWithSummary(
+        repository,
+        1,
+        "wi-1",
+        "All done",
+      ),
+    )
+    expect(patchBody).toEqual([
+      { op: "add", path: "/fields/System.State", value: "Closed" },
+    ])
+  })
+
+  test("does not repost when a marked comment already exists", async () => {
+    let posted = false
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (url.pathname.endsWith("/comments") && method === "POST") {
+        posted = true
+        return json({})
+      }
+      if (url.pathname.endsWith("/comments")) {
+        return json({
+          comments: [
+            { text: "All done\n\n<!-- ready-for-agent:work-item:wi-1 -->" },
+          ],
+        })
+      }
+      return json({
+        id: 1,
+        fields: { "System.State": "Closed" },
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(
+      service.ensureIssueCompletedWithSummary(
+        repository,
+        1,
+        "wi-1",
+        "All done",
+      ),
+    )
+    expect(posted).toBe(false)
+  })
+})
+
+describe("Azure DevOps closeOpenPullRequestsForBranch", () => {
+  test("abandons every active pull request for the branch", async () => {
+    const patched: number[] = []
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "PATCH") {
+        const match = /\/pullrequests\/(\d+)/.exec(url.pathname)
+        patched.push(Number(match?.[1]))
+        return json({ pullRequestId: Number(match?.[1]), status: "abandoned" })
+      }
+      return json({
+        value: [
+          { pullRequestId: 1, status: "active", isDraft: false },
+          { pullRequestId: 2, status: "active", isDraft: false },
+        ],
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(
+      service.closeOpenPullRequestsForBranch(repository, "feature"),
+    )
+    expect(patched.sort()).toEqual([1, 2])
+  })
+})
+
+describe("Azure DevOps deleteBranch", () => {
+  test("deletes the ref by posting the zero object id", async () => {
+    let postedBody: unknown = null
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      _input,
+      init,
+    ) => {
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "POST") {
+        postedBody = JSON.parse(String(init?.body))
+        return json({
+          value: [
+            {
+              name: "refs/heads/feature",
+              updateStatus: "succeeded",
+            },
+          ],
+        })
+      }
+      return json({
+        value: [{ name: "refs/heads/feature", objectId: "sha-abc" }],
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(service.deleteBranch(repository, "feature"))
+    expect(postedBody).toEqual([
+      {
+        name: "refs/heads/feature",
+        oldObjectId: "sha-abc",
+        newObjectId: "0000000000000000000000000000000000000000",
+      },
+    ])
+  })
+
+  test("is idempotent when the branch no longer exists", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        "/acme/widgets/_apis/git/repositories/widgets/refs?filter=heads%2Ffeature&api-version=7.1":
+          { value: [] },
+      }),
+    )
+    await Effect.runPromise(service.deleteBranch(repository, "feature"))
   })
 })
 
