@@ -46,6 +46,12 @@ const API_VERSION = "7.1"
  * See {@link requestUnknown}'s `apiVersion` override.
  */
 const COMMENTS_API_VERSION = "7.1-preview.3"
+/**
+ * `_apis/connectionData` is a legacy endpoint not exposed on the stable
+ * `7.1` API version; it requires the preview flag even though it returns
+ * stable-shaped data. See {@link requestUnknown}'s `apiVersion` override.
+ */
+const CONNECTION_DATA_API_VERSION = "7.1-preview"
 
 type AzureDevOpsFetch = typeof fetch
 
@@ -1054,6 +1060,7 @@ export const makeAzureDevOpsService = (options: {
           identity.organization,
           "/_apis/connectionData",
           `Failed to resolve authenticated Azure DevOps user for ${identity.organization}`,
+          { apiVersion: CONNECTION_DATA_API_VERSION },
         ),
       )
       const connectionData = yield* Effect.try({

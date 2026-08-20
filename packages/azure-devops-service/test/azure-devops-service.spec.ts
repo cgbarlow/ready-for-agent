@@ -107,7 +107,7 @@ describe("Azure DevOps getAuthenticatedUserLogin", () => {
     const service = makeAzureDevOpsServiceFromToken(
       "test-pat",
       fakeFetch({
-        "/acme/_apis/connectionData?api-version=7.1": {
+        "/acme/_apis/connectionData?api-version=7.1-preview": {
           authenticatedUser: {
             id: "user-id",
             providerDisplayName: "Jane Operator",
@@ -124,7 +124,7 @@ describe("Azure DevOps getAuthenticatedUserLogin", () => {
     const service = makeAzureDevOpsServiceFromToken(
       "test-pat",
       fakeFetch({
-        "/acme/_apis/connectionData?api-version=7.1": {
+        "/acme/_apis/connectionData?api-version=7.1-preview": {
           authenticatedUser: { id: "user-id" },
         },
       }),
@@ -138,7 +138,7 @@ describe("Azure DevOps getAuthenticatedUserLogin", () => {
     const service = makeAzureDevOpsServiceFromToken(
       "expired",
       fakeFetch({
-        "/acme/_apis/connectionData?api-version=7.1": new Response(
+        "/acme/_apis/connectionData?api-version=7.1-preview": new Response(
           "unauthorized",
           { status: 401 },
         ),
