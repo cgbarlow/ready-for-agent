@@ -173,6 +173,205 @@ describe("Azure DevOps hasCredentials / hasAmbientCredentials", () => {
   })
 })
 
+describe("Azure DevOps listReadyIssues", () => {
+  const wiqlPath = "POST /acme/widgets/_apis/wit/wiql?api-version=7.1"
+  const batchPath = (ids: string): string =>
+    `/acme/_apis/wit/workitems?ids=${ids}&$expand=all&errorPolicy=Omit&api-version=7.1`
+
+  test("lists Ready-labeled work items and populates open Predecessor blockers", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [wiqlPath]: { workItems: [{ id: 10 }, { id: 11 }] },
+        [batchPath("10,11")]: {
+          value: [
+            {
+              id: 10,
+              fields: {
+                "System.Title": "First",
+                "System.Description": "Body 1",
+                "System.State": "Active",
+                "System.CreatedDate": "2026-01-01T00:00:00Z",
+                "System.CreatedBy": { displayName: "Jane Operator" },
+              },
+              relations: [
+                {
+                  rel: "System.LinkTypes.Dependency-Reverse",
+                  url: "https://dev.azure.com/acme/_apis/wit/workItems/5",
+                },
+                {
+                  rel: "System.LinkTypes.Hierarchy-Forward",
+                  url: "https://dev.azure.com/acme/_apis/wit/workItems/99",
+                },
+              ],
+            },
+            {
+              id: 11,
+              fields: {
+                "System.Title": "Second",
+                "System.State": "New",
+                "System.CreatedDate": "2026-01-02T00:00:00Z",
+              },
+            },
+          ],
+        },
+        [batchPath("5")]: {
+          value: [{ id: 5, fields: { "System.State": "Active" } }],
+        },
+      }),
+    )
+
+    const issues = await Effect.runPromise(service.listReadyIssues(repository))
+
+    expect(issues).toEqual([
+      {
+        number: 10,
+        title: "First",
+        body: "Body 1",
+        url: "https://dev.azure.com/acme/widgets/_workitems/edit/10",
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        state: "OPEN",
+        author: "Jane Operator",
+        parent: null,
+        parentPosition: null,
+        hasChildren: false,
+        hierarchySupported: false,
+        blockedBy: [
+          {
+            number: 5,
+            url: "https://dev.azure.com/acme/widgets/_workitems/edit/5",
+          },
+        ],
+        closingPullRequests: [],
+      },
+      {
+        number: 11,
+        title: "Second",
+        body: "",
+        url: "https://dev.azure.com/acme/widgets/_workitems/edit/11",
+        createdAt: new Date("2026-01-02T00:00:00Z"),
+        state: "OPEN",
+        author: null,
+        parent: null,
+        parentPosition: null,
+        hasChildren: false,
+        hierarchySupported: false,
+        blockedBy: [],
+        closingPullRequests: [],
+      },
+    ])
+  })
+
+  test("excludes a Predecessor blocker once its work item is closed", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [wiqlPath]: { workItems: [{ id: 10 }] },
+        [batchPath("10")]: {
+          value: [
+            {
+              id: 10,
+              fields: {
+                "System.Title": "First",
+                "System.State": "Active",
+                "System.CreatedDate": "2026-01-01T00:00:00Z",
+              },
+              relations: [
+                {
+                  rel: "System.LinkTypes.Dependency-Reverse",
+                  url: "https://dev.azure.com/acme/_apis/wit/workItems/5",
+                },
+              ],
+            },
+          ],
+        },
+        [batchPath("5")]: {
+          value: [{ id: 5, fields: { "System.State": "Closed" } }],
+        },
+      }),
+    )
+
+    const issues = await Effect.runPromise(service.listReadyIssues(repository))
+    expect(issues[0]?.blockedBy).toEqual([])
+  })
+
+  test("never blocked by the Successor (forward) end of a dependency link", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [wiqlPath]: { workItems: [{ id: 10 }] },
+        [batchPath("10")]: {
+          value: [
+            {
+              id: 10,
+              fields: {
+                "System.Title": "First",
+                "System.State": "Active",
+                "System.CreatedDate": "2026-01-01T00:00:00Z",
+              },
+              relations: [
+                {
+                  rel: "System.LinkTypes.Dependency-Forward",
+                  url: "https://dev.azure.com/acme/_apis/wit/workItems/7",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    )
+
+    const issues = await Effect.runPromise(service.listReadyIssues(repository))
+    expect(issues[0]?.blockedBy).toEqual([])
+  })
+
+  test("returns an empty list when no work item is tagged ready-for-agent", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({ [wiqlPath]: { workItems: [] } }),
+    )
+    await expect(
+      Effect.runPromise(service.listReadyIssues(repository)),
+    ).resolves.toEqual([])
+  })
+
+  test("sends the WIQL query scoped to System.Tags", async () => {
+    let requestBody: unknown
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith("/wiql")) {
+        requestBody =
+          init?.body === undefined ? undefined : JSON.parse(String(init.body))
+        return json({ workItems: [] })
+      }
+      throw new Error(`Unexpected request: ${url.pathname}`)
+    }) as typeof fetch)
+    await Effect.runPromise(service.listReadyIssues(repository))
+    expect(requestBody).toEqual({
+      query:
+        "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project AND [System.Tags] CONTAINS 'ready-for-agent' ORDER BY [System.Id]",
+    })
+  })
+
+  test("rejects an unavailable project as project-unavailable", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [wiqlPath]: new Response("not found", { status: 404 }),
+      }),
+    )
+    const result = await Effect.runPromise(
+      service.listReadyIssues(repository).pipe(Effect.result),
+    )
+    expect(result).toEqual(
+      Result.fail(new AzureDevOpsProjectUnavailableError(repository)),
+    )
+  })
+})
+
 describe("Azure DevOps not-yet-implemented methods", () => {
   test("every remaining method fails with AzureDevOpsNotImplementedError", async () => {
     const service = makeAzureDevOpsServiceFromToken("test-pat", fetch)
@@ -180,10 +379,6 @@ describe("Azure DevOps not-yet-implemented methods", () => {
       readonly method: string
       readonly run: () => Effect.Effect<unknown, unknown>
     }> = [
-      {
-        method: "listReadyIssues",
-        run: () => service.listReadyIssues(repository),
-      },
       {
         method: "getOpenPullRequestNumber",
         run: () => service.getOpenPullRequestNumber(repository, "feature"),
@@ -253,7 +448,7 @@ describe("Azure DevOps not-yet-implemented methods", () => {
         run: () => service.deleteBranch(repository, "feature"),
       },
     ]
-    expect(cases).toHaveLength(14)
+    expect(cases).toHaveLength(13)
     for (const { method, run } of cases) {
       const error = await Effect.runPromise(run().pipe(Effect.flip))
       expect(error).toBeInstanceOf(AzureDevOpsNotImplementedError)
