@@ -40,6 +40,12 @@ import {
 const REQUEST_TIMEOUT = Duration.seconds(30)
 /** Azure DevOps REST API version pinned for stable response shapes. */
 const API_VERSION = "7.1"
+/**
+ * The Work Item Comments surface (`_apis/wit/workitems/{id}/comments`) is not
+ * exposed on the stable `7.1` API version; it requires this preview version.
+ * See {@link requestUnknown}'s `apiVersion` override.
+ */
+const COMMENTS_API_VERSION = "7.1-preview.3"
 
 type AzureDevOpsFetch = typeof fetch
 
@@ -544,7 +550,13 @@ const workItemTypeStatesPath = (
 ): string =>
   `/${encodeURIComponent(identity.project)}/_apis/wit/workitemtypes/${encodeURIComponent(workItemType)}/states`
 
-/** `vstfs:///CodeReview/CodeReviewId/{projectId}/{pullRequestId}`, the artifact id policy evaluations are scoped to. */
+/**
+ * `vstfs:///CodeReview/CodeReviewId/{projectId}/{pullRequestId}`, the artifact
+ * id policy evaluations are scoped to. This exact format, and the
+ * `repository.project.id` plumbing it depends on (see {@link loadPrChecks}),
+ * are unverified against a live Azure DevOps instance — see ADR 0060's
+ * "Considered Options" for the known risk and its fail-safe failure mode.
+ */
 const codeReviewArtifactId = (
   projectId: string,
   pullRequestId: number,
@@ -636,13 +648,15 @@ export const makeAzureDevOpsService = (options: {
       readonly body?: unknown
       /** Overrides the default `application/json` request Content-Type. */
       readonly contentType?: string
+      /** Overrides {@link API_VERSION}, e.g. for preview-only endpoints. */
+      readonly apiVersion?: string
     } = {},
   ): Effect.Effect<unknown, AzureDevOpsRequestError> =>
     Effect.tryPromise({
       try: async () => {
         const separator = path.includes("?") ? "&" : "?"
         const response = await fetchImpl(
-          `${organizationApiBase(organization)}${path}${separator}api-version=${API_VERSION}`,
+          `${organizationApiBase(organization)}${path}${separator}api-version=${init.apiVersion ?? API_VERSION}`,
           {
             method: init.method ?? "GET",
             headers: {
@@ -1730,9 +1744,14 @@ export const makeAzureDevOpsService = (options: {
           const failure = mergeResult.failure
           // Operational failures (auth, missing project, transport, 5xx)
           // always propagate. Azure DevOps reports merge preconditions that
-          // changed concurrently (stale head, still-pending policy) as 400 or
-          // 409; those are re-classified from a fresh pull request instead.
-          if (failure.statusCode !== 400 && failure.statusCode !== 409) {
+          // changed concurrently (stale head, still-pending/unsatisfied
+          // policy) as 400, 409, or 422; those are re-classified from a
+          // fresh pull request instead.
+          if (
+            failure.statusCode !== 400 &&
+            failure.statusCode !== 409 &&
+            failure.statusCode !== 422
+          ) {
             return yield* failure
           }
         }
@@ -1867,6 +1886,7 @@ export const makeAzureDevOpsService = (options: {
           identity.organization,
           workItemCommentsPath(identity, issueNumber),
           `Failed to list comments for Work Item ${issueRef}`,
+          { apiVersion: COMMENTS_API_VERSION },
         ).pipe(
           Effect.map((value) => decode(CommentListSchema, value).comments),
           Effect.mapError((error) =>
@@ -1892,7 +1912,11 @@ export const makeAzureDevOpsService = (options: {
             identity.organization,
             workItemCommentsPath(identity, issueNumber),
             `Failed to post completion summary on Work Item ${issueRef}`,
-            { method: "POST", body: { text: body } },
+            {
+              method: "POST",
+              body: { text: body },
+              apiVersion: COMMENTS_API_VERSION,
+            },
           ).pipe(
             Effect.map((value) => decode(CommentSchema, value)),
             Effect.mapError((error) =>
@@ -1918,36 +1942,42 @@ export const makeAzureDevOpsService = (options: {
 
       // No single "Closed" state name is guaranteed across process
       // templates: resolve the work item type's actual Completed-category
-      // state, falling back to the common "Closed" literal.
+      // state, falling back to the common "Closed" literal. The lookup is
+      // best-effort — any failure (network, decode, an unexpected 404 on a
+      // type name, etc.) falls back to the literal rather than failing the
+      // whole close-out, since the fallback already matches this codebase's
+      // existing `CLOSED_STATE_NAMES` read-side heuristic.
       const workItemType = workItem.fields["System.WorkItemType"]?.trim()
       let targetStateName = "Closed"
       if (workItemType !== undefined && workItemType !== "") {
-        const states = yield* unavailableOn404(
-          repository,
-          requestUnknown(
-            identity.organization,
-            workItemTypeStatesPath(identity, workItemType),
-            `Failed to load states for Work Item type ${workItemType} on ${repository.projectPath}`,
-          ).pipe(
-            Effect.map(
-              (value) => decode(WorkItemTypeStateListSchema, value).value,
-            ),
-            Effect.mapError((error) =>
-              error instanceof AzureDevOpsRequestError
-                ? error
-                : requestError(
-                    `Azure DevOps returned invalid Work Item type states for ${repository.projectPath}`,
-                    error,
-                  ),
-            ),
+        const statesResult = yield* requestUnknown(
+          identity.organization,
+          workItemTypeStatesPath(identity, workItemType),
+          `Failed to load states for Work Item type ${workItemType} on ${repository.projectPath}`,
+        ).pipe(
+          Effect.flatMap((value) =>
+            // Decode failures must land in the typed error channel (not a
+            // thrown defect) so Effect.result below can actually observe and
+            // fall back on them, matching the doc comment above.
+            Effect.try({
+              try: () => decode(WorkItemTypeStateListSchema, value).value,
+              catch: (cause) =>
+                requestError(
+                  `Azure DevOps returned invalid Work Item type states for ${repository.projectPath}`,
+                  cause,
+                ),
+            }),
           ),
+          Effect.result,
         )
-        const completed = states.find(
-          (state) =>
-            (state.category ?? "").trim().toLowerCase() === "completed",
-        )
-        if (completed !== undefined) {
-          targetStateName = completed.name
+        if (Result.isSuccess(statesResult)) {
+          const completed = statesResult.success.find(
+            (state) =>
+              (state.category ?? "").trim().toLowerCase() === "completed",
+          )
+          if (completed !== undefined) {
+            targetStateName = completed.name
+          }
         }
       }
 
