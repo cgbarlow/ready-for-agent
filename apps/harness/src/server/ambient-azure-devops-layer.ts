@@ -26,10 +26,12 @@ import {
  */
 export const ambientAzureDevOpsLayer = (options: {
   readonly environment?: Partial<Record<string, string | undefined>>
-}): Layer.Layer<AzureDevOpsService> =>
-  Layer.succeed(
+}): Layer.Layer<AzureDevOpsService> => {
+  const token = options.environment?.[AZURE_DEVOPS_PAT_ENV_VAR]?.trim()
+  return Layer.succeed(
     AzureDevOpsService,
-    makeAzureDevOpsService({
-      token: options.environment?.[AZURE_DEVOPS_PAT_ENV_VAR],
-    }),
+    makeAzureDevOpsService(
+      token === undefined || token === "" ? {} : { token },
+    ),
   )
+}
