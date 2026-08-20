@@ -262,6 +262,38 @@ describe("Azure DevOps listReadyIssues", () => {
     ])
   })
 
+  test("excludes a Ready-tagged work item once it is itself closed", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        [wiqlPath]: { workItems: [{ id: 10 }, { id: 11 }] },
+        [batchPath("10,11")]: {
+          value: [
+            {
+              id: 10,
+              fields: {
+                "System.Title": "Still open",
+                "System.State": "Active",
+                "System.CreatedDate": "2026-01-01T00:00:00Z",
+              },
+            },
+            {
+              id: 11,
+              fields: {
+                "System.Title": "Already closed",
+                "System.State": "Closed",
+                "System.CreatedDate": "2026-01-02T00:00:00Z",
+              },
+            },
+          ],
+        },
+      }),
+    )
+
+    const issues = await Effect.runPromise(service.listReadyIssues(repository))
+    expect(issues.map((issue) => issue.number)).toEqual([10])
+  })
+
   test("excludes a Predecessor blocker once its work item is closed", async () => {
     const service = makeAzureDevOpsServiceFromToken(
       "test-pat",

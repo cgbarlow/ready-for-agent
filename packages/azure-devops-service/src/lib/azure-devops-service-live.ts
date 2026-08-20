@@ -1138,6 +1138,7 @@ export const makeAzureDevOpsService = (options: {
         return yield* Effect.try({
           try: () =>
             items
+              .filter((item) => isOpenState(item.fields["System.State"]))
               .map((item) => toReadyLabeledIssue(identity, item, stateById))
               .sort((left, right) => left.number - right.number),
           catch: (cause) =>
