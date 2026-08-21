@@ -81,7 +81,18 @@ const ProjectSchema = Schema.Struct({
 const ConnectionDataSchema = Schema.Struct({
   authenticatedUser: Schema.Struct({
     id: Schema.optional(Schema.String),
+    /**
+     * The Entra/AAD directory display name — can differ from the ADO-native
+     * `customDisplayName` for the same account (e.g. "Christopher Barlow" vs
+     * "Chris Barlow"). Never used alone for author matching; see
+     * {@link resolveAuthenticatedUserLogin}.
+     */
     providerDisplayName: Schema.optional(Schema.NullOr(Schema.String)),
+    /**
+     * The ADO-native display name — matches `System.CreatedBy.displayName`
+     * on work items authored by this account, unlike `providerDisplayName`.
+     */
+    customDisplayName: Schema.optional(Schema.NullOr(Schema.String)),
   }),
 })
 
@@ -1068,9 +1079,26 @@ export const makeAzureDevOpsService = (options: {
         catch: (cause) =>
           requestError("Azure DevOps returned invalid connection data", cause),
       })
-      const displayName = connectionData.authenticatedUser.providerDisplayName
-      if (typeof displayName === "string" && displayName.trim() !== "") {
-        return displayName
+      // Prefer customDisplayName: it matches System.CreatedBy.displayName on
+      // work items authored by this account. providerDisplayName is the
+      // Entra/AAD directory name, which can read differently for the same
+      // account (e.g. "Christopher Barlow" vs work items' "Chris Barlow"),
+      // silently breaking author-scoped relevance matching if preferred.
+      const customDisplayName =
+        connectionData.authenticatedUser.customDisplayName
+      if (
+        typeof customDisplayName === "string" &&
+        customDisplayName.trim() !== ""
+      ) {
+        return customDisplayName
+      }
+      const providerDisplayName =
+        connectionData.authenticatedUser.providerDisplayName
+      if (
+        typeof providerDisplayName === "string" &&
+        providerDisplayName.trim() !== ""
+      ) {
+        return providerDisplayName
       }
       const id = connectionData.authenticatedUser.id
       if (typeof id === "string" && id.trim() !== "") {

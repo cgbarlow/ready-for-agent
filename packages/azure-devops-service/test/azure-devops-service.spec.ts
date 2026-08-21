@@ -120,6 +120,28 @@ describe("Azure DevOps getAuthenticatedUserLogin", () => {
     ).resolves.toBe("Jane Operator")
   })
 
+  test("prefers customDisplayName over the Entra directory providerDisplayName", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        "/acme/_apis/connectionData?api-version=7.1-preview": {
+          authenticatedUser: {
+            id: "user-id",
+            // Real Azure DevOps accounts can report a different Entra/AAD
+            // directory name than their ADO-native customDisplayName — the
+            // latter is what matches System.CreatedBy.displayName on work
+            // items authored by this account, so it must win.
+            providerDisplayName: "Christopher Barlow",
+            customDisplayName: "Chris Barlow",
+          },
+        },
+      }),
+    )
+    await expect(
+      Effect.runPromise(service.getAuthenticatedUserLogin(repository)),
+    ).resolves.toBe("Chris Barlow")
+  })
+
   test("falls back to the authenticated user id when display name is absent", async () => {
     const service = makeAzureDevOpsServiceFromToken(
       "test-pat",
