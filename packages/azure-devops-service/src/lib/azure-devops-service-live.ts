@@ -34,6 +34,7 @@ import {
   type AzureDevOpsProjectIdentity,
   type AzureDevOpsReadyLabeledIssue,
   type AzureDevOpsRepository,
+  azureDevOpsRepositoryName,
   splitAzureDevOpsProjectPath,
 } from "./types.js"
 
@@ -533,22 +534,23 @@ const branchFromRefName = (ref: string): string =>
   ref.startsWith(REFS_HEADS_PREFIX) ? ref.slice(REFS_HEADS_PREFIX.length) : ref
 
 /**
- * Azure DevOps Git Pull Requests are scoped by repository, not project. This
- * codebase assumes one Git repository per project sharing the project's name
- * (see {@link splitAzureDevOpsProjectPath} doc), so the repositoryId path
- * segment is always the project name.
+ * Azure DevOps Git Pull Requests are scoped by repository, not project. The
+ * repositoryId path segment is the Git repository's own name — which is
+ * usually, but not always, the same string as the project name (see
+ * {@link azureDevOpsRepositoryName}); a project can contain multiple,
+ * differently-named Git repositories.
  */
 const pullRequestsPath = (
   identity: AzureDevOpsProjectIdentity,
   suffix = "",
 ): string =>
-  `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(identity.project)}/pullrequests${suffix}`
+  `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(azureDevOpsRepositoryName(identity))}/pullrequests${suffix}`
 
 const repositoryMetaPath = (identity: AzureDevOpsProjectIdentity): string =>
-  `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(identity.project)}`
+  `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(azureDevOpsRepositoryName(identity))}`
 
 const refsPath = (identity: AzureDevOpsProjectIdentity, suffix = ""): string =>
-  `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(identity.project)}/refs${suffix}`
+  `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(azureDevOpsRepositoryName(identity))}/refs${suffix}`
 
 const workItemPath = (
   identity: AzureDevOpsProjectIdentity,
@@ -896,7 +898,7 @@ export const makeAzureDevOpsService = (options: {
       if (headSha === null || headSha.trim() === "") return null
       const result = yield* requestUnknown(
         identity.organization,
-        `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(identity.project)}/commits/${encodeURIComponent(headSha)}`,
+        `/${encodeURIComponent(identity.project)}/_apis/git/repositories/${encodeURIComponent(azureDevOpsRepositoryName(identity))}/commits/${encodeURIComponent(headSha)}`,
         `Failed to load head commit ${headSha}`,
       ).pipe(Effect.result)
       if (Result.isFailure(result)) return null
@@ -1051,10 +1053,19 @@ export const makeAzureDevOpsService = (options: {
           catch: (cause) =>
             requestError("Azure DevOps returned an invalid project", cause),
         })
+        // Project verification only canonicalizes the org/project segments
+        // (e.g. case correction); an explicit repository segment (present
+        // when the Git repository name differs from the project name) is
+        // carried through unchanged — this method is intentionally
+        // project-scoped only and never validates the Git repository name.
+        const projectPath =
+          identity.repository === undefined
+            ? `${identity.organization}/${project.name}`
+            : `${identity.organization}/${project.name}/${identity.repository}`
         return {
           forge: repository.forge,
           forgeHost: repository.forgeHost,
-          projectPath: `${identity.organization}/${project.name}`,
+          projectPath,
         } satisfies AzureDevOpsRepository
       },
     ),

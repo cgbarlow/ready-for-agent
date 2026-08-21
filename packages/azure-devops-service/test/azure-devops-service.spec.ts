@@ -95,10 +95,38 @@ describe("Azure DevOps verifyProject", () => {
     }) as unknown as typeof fetch)
     const error = await Effect.runPromise(
       service
-        .verifyProject({ ...repository, projectPath: "acme/widgets/extra" })
+        .verifyProject({
+          ...repository,
+          projectPath: "acme/widgets/extra/toomany",
+        })
         .pipe(Effect.flip),
     )
     expect(error).toBeInstanceOf(AzureDevOpsRequestError)
+  })
+
+  test("canonicalizes project casing while preserving an explicit repository segment", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        "/acme/_apis/projects/Default?api-version=7.1": {
+          id: "11111111-1111-1111-1111-111111111111",
+          name: "Default",
+        },
+      }),
+    )
+
+    await expect(
+      Effect.runPromise(
+        service.verifyProject({
+          ...repository,
+          projectPath: "acme/Default/gantry",
+        }),
+      ),
+    ).resolves.toEqual({
+      forge: "azure-devops",
+      forgeHost: "dev.azure.com",
+      projectPath: "acme/Default/gantry",
+    })
   })
 })
 
@@ -1444,5 +1472,210 @@ describe("Azure DevOps markPullRequestReadyForReview", () => {
         .pipe(Effect.flip),
     )
     expect(error).toBeInstanceOf(AzureDevOpsRequestError)
+  })
+})
+
+// A project whose name differs from its Git repository name — the scenario
+// from issue #15 (org `MSD-Production`, project `Default`, repository
+// `gantry`). Project Path folds the repository name in as a third segment
+// only because it differs from the project name (see
+// AzureDevOpsRepository.projectPath doc).
+const repositoryWithDistinctRepoName = {
+  forge: "azure-devops",
+  forgeHost: "dev.azure.com",
+  projectPath: "MSD-Production/Default/gantry",
+}
+
+describe("Azure DevOps: Git repository name differs from project name", () => {
+  test("createDraftPullRequest resolves the default base branch from the repository, not the project, resource", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        "/MSD-Production/Default/_apis/git/repositories/gantry?api-version=7.1":
+          { defaultBranch: "refs/heads/main" },
+        "POST /MSD-Production/Default/_apis/git/repositories/gantry/pullrequests?api-version=7.1":
+          { pullRequestId: 9, status: "active", isDraft: true },
+      }),
+    )
+    await expect(
+      Effect.runPromise(
+        service.createDraftPullRequest(repositoryWithDistinctRepoName, {
+          headRefName: "feature",
+          title: "t",
+          body: "b",
+        }),
+      ),
+    ).resolves.toBe(9)
+  })
+
+  test("findOpenPullRequestNumber / getOpenPullRequestNumber look up the pull request against the repository resource", async () => {
+    const service = makeAzureDevOpsServiceFromToken(
+      "test-pat",
+      fakeFetch({
+        "/MSD-Production/Default/_apis/git/repositories/gantry/pullrequests?searchCriteria.status=active&searchCriteria.sourceRefName=refs%2Fheads%2Ffeature&api-version=7.1":
+          {
+            value: [
+              {
+                pullRequestId: 42,
+                status: "active",
+                isDraft: true,
+                title: "t",
+                description: "b",
+                sourceRefName: "refs/heads/feature",
+              },
+            ],
+          },
+      }),
+    )
+    await expect(
+      Effect.runPromise(
+        service.findOpenPullRequestNumber(
+          repositoryWithDistinctRepoName,
+          "feature",
+        ),
+      ),
+    ).resolves.toBe(42)
+    await expect(
+      Effect.runPromise(
+        service.getOpenPullRequestNumber(
+          repositoryWithDistinctRepoName,
+          "feature",
+        ),
+      ),
+    ).resolves.toBe(42)
+  })
+
+  test("markPullRequestReadyForReview clears the draft flag against the repository resource", async () => {
+    let updateBody: unknown = null
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      expect(url.pathname).toContain(
+        "/_apis/git/repositories/gantry/pullrequests",
+      )
+      if ((init?.method ?? "GET") === "PATCH") {
+        updateBody = JSON.parse(String(init?.body))
+        return json({ pullRequestId: 42, isDraft: false })
+      }
+      return json({
+        value: [{ pullRequestId: 42, status: "active", isDraft: true }],
+      })
+    }) as unknown as typeof fetch)
+
+    await Effect.runPromise(
+      service.markPullRequestReadyForReview(
+        repositoryWithDistinctRepoName,
+        "feature",
+      ),
+    )
+    expect(updateBody).toEqual({ isDraft: false })
+  })
+
+  test("mergePullRequest merges a ready pull request against the repository resource", async () => {
+    let patchBody: unknown = null
+    const service = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      expect(url.pathname.startsWith("/MSD-Production/Default/_apis/")).toBe(
+        true,
+      )
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "PATCH") {
+        patchBody = JSON.parse(String(init?.body))
+        return json({ pullRequestId: 42, status: "completed" })
+      }
+      if (url.pathname.endsWith("/statuses")) {
+        return json({ value: [] })
+      }
+      if (url.pathname.includes("/policy/evaluations")) {
+        return json({ value: [{ evaluationId: "e1", status: "approved" }] })
+      }
+      expect(url.pathname).toContain(
+        "/_apis/git/repositories/gantry/pullrequests",
+      )
+      return json({
+        value: [
+          {
+            pullRequestId: 42,
+            status: "active",
+            isDraft: false,
+            mergeStatus: "succeeded",
+            lastMergeSourceCommit: { commitId: "sha-1" },
+            repository: { project: { id: "proj-1" } },
+          },
+        ],
+      })
+    }) as unknown as typeof fetch)
+
+    const result = await Effect.runPromise(
+      service.mergePullRequest(repositoryWithDistinctRepoName, "feature"),
+    )
+    expect(result).toEqual({ _tag: "merged" })
+    expect(patchBody).toEqual({
+      status: "completed",
+      lastMergeSourceCommit: { commitId: "sha-1" },
+    })
+  })
+
+  test("closeOpenPullRequestsForBranch and deleteBranch address the repository resource, not the project", async () => {
+    const patched: number[] = []
+    const closeService = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      expect(url.pathname).toContain(
+        "/_apis/git/repositories/gantry/pullrequests",
+      )
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "PATCH") {
+        const match = /\/pullrequests\/(\d+)/.exec(url.pathname)
+        patched.push(Number(match?.[1]))
+        return json({ pullRequestId: Number(match?.[1]), status: "abandoned" })
+      }
+      return json({
+        value: [{ pullRequestId: 1, status: "active", isDraft: false }],
+      })
+    }) as unknown as typeof fetch)
+    await Effect.runPromise(
+      closeService.closeOpenPullRequestsForBranch(
+        repositoryWithDistinctRepoName,
+        "feature",
+      ),
+    )
+    expect(patched).toEqual([1])
+
+    let postedBody: unknown = null
+    const deleteService = makeAzureDevOpsServiceFromToken("test-pat", (async (
+      input,
+      init,
+    ) => {
+      const url = new URL(String(input))
+      expect(url.pathname).toContain("/_apis/git/repositories/gantry/refs")
+      const method = (init?.method ?? "GET").toUpperCase()
+      if (method === "POST") {
+        postedBody = JSON.parse(String(init?.body))
+        return json({
+          value: [{ name: "refs/heads/feature", updateStatus: "succeeded" }],
+        })
+      }
+      return json({
+        value: [{ name: "refs/heads/feature", objectId: "sha-abc" }],
+      })
+    }) as unknown as typeof fetch)
+    await Effect.runPromise(
+      deleteService.deleteBranch(repositoryWithDistinctRepoName, "feature"),
+    )
+    expect(postedBody).toEqual([
+      {
+        name: "refs/heads/feature",
+        oldObjectId: "sha-abc",
+        newObjectId: "0000000000000000000000000000000000000000",
+      },
+    ])
   })
 })
