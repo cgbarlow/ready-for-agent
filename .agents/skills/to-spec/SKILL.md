@@ -16,7 +16,7 @@ The issue tracker and triage label vocabulary should have been provided to you �
 
 Check with the user that these seams match their expectations.
 
-3. Write the spec using the template below, then publish it to the project issue tracker. Do NOT apply the `ready-for-agent` triage label (or any other triage label) to this spec issue — it is reference material for `/to-tickets` and for humans/agents working the real child tickets, not itself an implementable vertical slice. Only the child tickets that `/to-tickets` creates from this spec should carry `ready-for-agent`.
+3. Write the spec using the template below, then publish it to the project issue tracker. Reserve the `ready-for-agent` triage label for the child tickets `/to-tickets` later creates from this spec — the spec issue itself is reference material for `/to-tickets` and for humans/agents working those child tickets, not a tracer-bullet vertical slice for the harness to pick up on its own.
 
 <spec-template>
 
