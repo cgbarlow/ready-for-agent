@@ -5,6 +5,9 @@ const isGitHubTokenEnvName = (name: string) =>
 
 const isGitLabTokenEnvName = (name: string) => name.startsWith("GITLAB_TOKEN")
 
+const isAzureDevOpsTokenEnvName = (name: string) =>
+  name === "AZURE_DEVOPS_EXT_PAT"
+
 /**
  * Harness operational names that must never reach repository-controlled child
  * processes. Always stripped, independent of Forge-token options.
@@ -28,9 +31,10 @@ const isHarnessOwnedEnvironmentName = (name: string) =>
 
 export type SanitizeInheritedEnvironmentOptions = {
   /**
-   * When true (default), strip GitHub and GitLab token variables.
-   * Set false when the backend is not receiving vault-backed Keymaxxer MCP so
-   * ambient Forge authentication remains available to Agent Turns.
+   * When true (default), strip GitHub, GitLab, and Azure DevOps token
+   * variables. Set false when the backend is not receiving vault-backed
+   * Keymaxxer MCP so ambient Forge authentication remains available to Agent
+   * Turns.
    */
   readonly stripForgeTokens?: boolean
   /**
@@ -41,6 +45,10 @@ export type SanitizeInheritedEnvironmentOptions = {
    * Override GitLab token stripping independently from other Forges.
    */
   readonly stripGitLabTokens?: boolean
+  /**
+   * Override Azure DevOps token stripping independently from other Forges.
+   */
+  readonly stripAzureDevOpsTokens?: boolean
 }
 
 /**
@@ -56,13 +64,16 @@ export const sanitizeInheritedEnvironment = (
     options.stripGitHubTokens ?? options.stripForgeTokens ?? true
   const stripGitLabTokens =
     options.stripGitLabTokens ?? options.stripForgeTokens ?? true
+  const stripAzureDevOpsTokens =
+    options.stripAzureDevOpsTokens ?? options.stripForgeTokens ?? true
   return Object.fromEntries(
     Object.entries(environment).filter(
       (entry): entry is [string, string] =>
         entry[1] !== undefined &&
         !isHarnessOwnedEnvironmentName(entry[0]) &&
         !(stripGitHubTokens && isGitHubTokenEnvName(entry[0])) &&
-        !(stripGitLabTokens && isGitLabTokenEnvName(entry[0])),
+        !(stripGitLabTokens && isGitLabTokenEnvName(entry[0])) &&
+        !(stripAzureDevOpsTokens && isAzureDevOpsTokenEnvName(entry[0])),
     ),
   )
 }

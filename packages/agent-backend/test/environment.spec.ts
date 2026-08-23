@@ -58,6 +58,7 @@ describe("sanitizeInheritedEnvironment", () => {
         GH_TOKEN: "ambient",
         GITHUB_TOKEN: "ambient-github",
         GITLAB_TOKEN: "ambient-gitlab",
+        AZURE_DEVOPS_EXT_PAT: "ambient-azure-devops",
         SQLITE_DATABASE_PATH: "/tmp/ready-for-agent.db",
         KEYMAXXER_SIDECAR_URL: "http://127.0.0.1:6057/cap/mcp",
         KEYMAXXER_MASTER_KEY: "master",
@@ -70,6 +71,7 @@ describe("sanitizeInheritedEnvironment", () => {
       GH_TOKEN: "ambient",
       GITHUB_TOKEN: "ambient-github",
       GITLAB_TOKEN: "ambient-gitlab",
+      AZURE_DEVOPS_EXT_PAT: "ambient-azure-devops",
     })
   })
 
@@ -79,6 +81,7 @@ describe("sanitizeInheritedEnvironment", () => {
       GH_TOKEN: "secret",
       GITHUB_TOKEN: "secret-github",
       GITLAB_TOKEN: "secret-gitlab",
+      AZURE_DEVOPS_EXT_PAT: "secret-azure-devops",
       SQLITE_DATABASE_PATH: "/tmp/ready-for-agent.db",
       KEYMAXXER_SIDECAR_URL: "http://127.0.0.1:6057/cap/mcp",
     })
@@ -96,13 +99,16 @@ describe("sanitizeInheritedEnvironment", () => {
       GITLAB_TOKEN: "d",
       GITLAB_TOKEN_REPO: "e",
       GITLAB_TOKENPROJECT: "f",
+      AZURE_DEVOPS_EXT_PAT: "g",
       NOT_GITHUB_TOKEN: "keep",
       NOT_GITLAB_TOKEN: "keep-too",
+      NOT_AZURE_DEVOPS_EXT_PAT: "keep-three",
     })
     expect(result).toEqual({
       HOME: "/home/user",
       NOT_GITHUB_TOKEN: "keep",
       NOT_GITLAB_TOKEN: "keep-too",
+      NOT_AZURE_DEVOPS_EXT_PAT: "keep-three",
     })
   })
 
@@ -116,6 +122,7 @@ describe("sanitizeInheritedEnvironment", () => {
         GITLAB_TOKEN: "d",
         GITLAB_TOKEN_REPO: "e",
         GITLAB_TOKENPROJECT: "f",
+        AZURE_DEVOPS_EXT_PAT: "g",
         NOT_GITHUB_TOKEN: "keep",
       },
       { stripForgeTokens: false },
@@ -128,6 +135,7 @@ describe("sanitizeInheritedEnvironment", () => {
       GITLAB_TOKEN: "d",
       GITLAB_TOKEN_REPO: "e",
       GITLAB_TOKENPROJECT: "f",
+      AZURE_DEVOPS_EXT_PAT: "g",
       NOT_GITHUB_TOKEN: "keep",
     })
   })
@@ -138,14 +146,17 @@ describe("sanitizeInheritedEnvironment", () => {
         {
           GITHUB_TOKEN: "github",
           GITLAB_TOKEN: "gitlab",
+          AZURE_DEVOPS_EXT_PAT: "azure-devops",
         },
         {
           stripGitHubTokens: true,
           stripGitLabTokens: false,
+          stripAzureDevOpsTokens: false,
         },
       ),
     ).toEqual({
       GITLAB_TOKEN: "gitlab",
+      AZURE_DEVOPS_EXT_PAT: "azure-devops",
     })
   })
 
@@ -155,11 +166,27 @@ describe("sanitizeInheritedEnvironment", () => {
         {
           GITHUB_TOKEN: "github",
           GITLAB_TOKEN: "gitlab",
+          AZURE_DEVOPS_EXT_PAT: "azure-devops",
         },
         { stripGitHubTokens: false },
       ),
     ).toEqual({
       GITHUB_TOKEN: "github",
+    })
+  })
+
+  it("keeps stripAzureDevOpsTokens scoped to Azure DevOps", () => {
+    expect(
+      sanitizeInheritedEnvironment(
+        {
+          GITHUB_TOKEN: "github",
+          GITLAB_TOKEN: "gitlab",
+          AZURE_DEVOPS_EXT_PAT: "azure-devops",
+        },
+        { stripAzureDevOpsTokens: false },
+      ),
+    ).toEqual({
+      AZURE_DEVOPS_EXT_PAT: "azure-devops",
     })
   })
 })
