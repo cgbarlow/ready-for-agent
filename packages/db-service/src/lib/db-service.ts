@@ -6,6 +6,7 @@ import { isSelectableAgentBackendId } from "@ready-for-agent/agent-backend"
 import {
   AgentBackendChangeBlockedError,
   DatabaseError,
+  GuaranteedMinAgentTurnsExceedsCapError,
   InvalidConfigInputError,
   InvalidIssueInputError,
   InvalidRepositoryInputError,
@@ -227,6 +228,29 @@ const effectiveAgentBackend = (
   harnessDefault: string,
 ): string => repositoryOverride ?? harnessDefault
 
+/**
+ * Normalize a Repository guaranteed-minimum concurrent Agent Turns floor.
+ * Null clears the guarantee (fully fair-share). Non-null must be a
+ * non-negative integer.
+ */
+const normalizeGuaranteedMinAgentTurns = (
+  value: number | null,
+): Effect.Effect<number | null, InvalidRepositorySettingsError> => {
+  if (value === null) {
+    return Effect.succeed(null)
+  }
+  if (!Number.isSafeInteger(value) || value < 0) {
+    return Effect.fail(
+      new InvalidRepositorySettingsError({
+        field: "guaranteedMinConcurrentAgentTurns",
+        message:
+          "guaranteedMinConcurrentAgentTurns must be a non-negative integer",
+      }),
+    )
+  }
+  return Effect.succeed(value)
+}
+
 const toDatabaseError = (error: SqlError) =>
   new DatabaseError({
     message: `Database error: ${formatSqlError(error)}`,
@@ -272,6 +296,7 @@ const decodeRunningStepRows = (rows: ReadonlyArray<unknown>) =>
 const repositorySelectColumns = `id, forge, forge_host, project_path, local_path, is_bare, paused,
              selected_agent_backend, default_model, default_thinking_level,
              review_model, review_thinking_level, backend_model_prefs, merge_policy,
+             guaranteed_min_concurrent_agent_turns,
              include_all_issue_authors, wait_for_ready_for_review_checks,
              issues_reconciled_at`
 
@@ -294,6 +319,7 @@ const toRepositoryRecord = (row: RepositorySqlRow): RepositoryRecord =>
     reviewModel: row.reviewModel,
     reviewThinkingLevel: row.reviewThinkingLevel,
     mergePolicy: row.mergePolicy,
+    guaranteedMinConcurrentAgentTurns: row.guaranteedMinConcurrentAgentTurns,
     includeAllIssueAuthors: row.includeAllIssueAuthors,
     waitForReadyForReviewChecks: row.waitForReadyForReviewChecks,
     issuesReconciledAt: row.issuesReconciledAt,
@@ -352,7 +378,10 @@ export interface DbServiceShape {
     input: UpdateConfigInput,
   ) => Effect.Effect<
     ConfigRecord,
-    InvalidConfigInputError | AgentBackendChangeBlockedError | DatabaseError
+    | InvalidConfigInputError
+    | AgentBackendChangeBlockedError
+    | GuaranteedMinAgentTurnsExceedsCapError
+    | DatabaseError
   >
   /**
    * Fleet-wide unfinished Work Item total (not terminal complete/failed/
@@ -405,6 +434,7 @@ export interface DbServiceShape {
     | RepositoryIdentityChangeBlockedError
     | RepositoryAlreadyExistsError
     | RepositoryNotFoundError
+    | GuaranteedMinAgentTurnsExceedsCapError
     | DatabaseError
   >
   readonly pauseRepository: (
@@ -905,6 +935,26 @@ export const DbServiceLive = Layer.effect(
                 message: "defaultModel cannot be empty",
               })
             }
+            if (maxConcurrentAgentTurns < latest.maxConcurrentAgentTurns) {
+              // Only lowering the cap can newly oversubscribe guarantees.
+              const guaranteedSumRows = (yield* sql
+                .unsafe(
+                  `SELECT COALESCE(SUM(guaranteed_min_concurrent_agent_turns), 0) AS sum
+                   FROM repository
+                   WHERE guaranteed_min_concurrent_agent_turns IS NOT NULL`,
+                )
+                .pipe(Effect.mapError(toDatabaseError))) as readonly {
+                readonly sum: number
+              }[]
+              const guaranteedSum = guaranteedSumRows[0]?.sum ?? 0
+              if (guaranteedSum > maxConcurrentAgentTurns) {
+                return yield* new GuaranteedMinAgentTurnsExceedsCapError({
+                  message: `Cannot lower maxConcurrentAgentTurns to ${maxConcurrentAgentTurns}: the sum of all Repositories' guaranteed-minimum Agent Turns (${guaranteedSum}) would exceed it`,
+                  maxConcurrentAgentTurns,
+                  sumOfGuaranteedMinConcurrentAgentTurns: guaranteedSum,
+                })
+              }
+            }
             // Merge prefs from the in-txn row so concurrent writers do not
             // clobber each other's per-backend map entries.
             const prefsMap = parseBackendModelPrefsMap(latest.backendModelPrefs)
@@ -969,12 +1019,14 @@ export const DbServiceLive = Layer.effect(
               if (
                 tag === "AgentBackendChangeBlockedError" ||
                 tag === "DatabaseError" ||
-                tag === "InvalidConfigInputError"
+                tag === "InvalidConfigInputError" ||
+                tag === "GuaranteedMinAgentTurnsExceedsCapError"
               ) {
                 return error as
                   | AgentBackendChangeBlockedError
                   | DatabaseError
                   | InvalidConfigInputError
+                  | GuaranteedMinAgentTurnsExceedsCapError
               }
             }
             return toDatabaseError(error as SqlError)
@@ -1121,6 +1173,13 @@ export const DbServiceLive = Layer.effect(
           : yield* normalizeRepositoryAgentBackendOverride(
               input.selectedAgentBackend,
             )
+      // undefined = leave guarantee unchanged; null/number = clear/set after validate.
+      const requestedGuaranteedMin =
+        input.guaranteedMinConcurrentAgentTurns === undefined
+          ? undefined
+          : yield* normalizeGuaranteedMinAgentTurns(
+              input.guaranteedMinConcurrentAgentTurns,
+            )
       const now = yield* Clock.currentTimeMillis
       const result = yield* sql
         .withTransaction(
@@ -1129,23 +1188,28 @@ export const DbServiceLive = Layer.effect(
             // config switches cannot mis-key prefs / flat columns.
             const configRows = yield* sql
               .unsafe(
-                `SELECT selected_agent_backend AS selectedAgentBackend
+                `SELECT selected_agent_backend AS selectedAgentBackend,
+                        max_concurrent_agent_turns AS maxConcurrentAgentTurns
                  FROM config WHERE id = 'default'`,
               )
               .pipe(Effect.mapError(toDatabaseError))
-            const harnessDefault =
-              (
-                configRows[0] as
-                  | { readonly selectedAgentBackend: string }
-                  | undefined
-              )?.selectedAgentBackend ?? "opencode"
+            const configRow = configRows[0] as
+              | {
+                  readonly selectedAgentBackend: string
+                  readonly maxConcurrentAgentTurns: number
+                }
+              | undefined
+            const harnessDefault = configRow?.selectedAgentBackend ?? "opencode"
+            const maxConcurrentAgentTurns =
+              configRow?.maxConcurrentAgentTurns ?? 2
             const existingRows = yield* sql
               .unsafe(
                 `SELECT forge,
                         forge_host AS forgeHost,
                         project_path AS projectPath,
                         selected_agent_backend AS selectedAgentBackend,
-                        backend_model_prefs AS backendModelPrefs
+                        backend_model_prefs AS backendModelPrefs,
+                        guaranteed_min_concurrent_agent_turns AS guaranteedMinConcurrentAgentTurns
                  FROM repository WHERE id = ?`,
                 [input.repositoryId],
               )
@@ -1157,6 +1221,7 @@ export const DbServiceLive = Layer.effect(
                   readonly forge: RepositoryRecord["forge"]
                   readonly forgeHost: string
                   readonly projectPath: string
+                  readonly guaranteedMinConcurrentAgentTurns: number | null
                 }
               | undefined
             if (!existing) {
@@ -1235,6 +1300,36 @@ export const DbServiceLive = Layer.effect(
                 })
               }
             }
+            const previousGuaranteedMin =
+              existing.guaranteedMinConcurrentAgentTurns ?? null
+            const nextGuaranteedMin =
+              requestedGuaranteedMin === undefined
+                ? previousGuaranteedMin
+                : requestedGuaranteedMin
+            const guaranteedMinRaised =
+              (nextGuaranteedMin ?? 0) > (previousGuaranteedMin ?? 0)
+            if (guaranteedMinRaised) {
+              const otherRepoSumRows = (yield* sql
+                .unsafe(
+                  `SELECT COALESCE(SUM(guaranteed_min_concurrent_agent_turns), 0) AS sum
+                   FROM repository
+                   WHERE id <> ?
+                     AND guaranteed_min_concurrent_agent_turns IS NOT NULL`,
+                  [input.repositoryId],
+                )
+                .pipe(Effect.mapError(toDatabaseError))) as readonly {
+                readonly sum: number
+              }[]
+              const otherRepoSum = otherRepoSumRows[0]?.sum ?? 0
+              const totalGuaranteed = otherRepoSum + (nextGuaranteedMin ?? 0)
+              if (totalGuaranteed > maxConcurrentAgentTurns) {
+                return yield* new GuaranteedMinAgentTurnsExceedsCapError({
+                  message: `Cannot set guaranteed-minimum Agent Turns to ${nextGuaranteedMin}: the sum of all Repositories' guarantees (${totalGuaranteed}) would exceed maxConcurrentAgentTurns (${maxConcurrentAgentTurns})`,
+                  maxConcurrentAgentTurns,
+                  sumOfGuaranteedMinConcurrentAgentTurns: totalGuaranteed,
+                })
+              }
+            }
             const effectiveBackend = effectiveAgentBackend(
               nextOverride,
               harnessDefault,
@@ -1267,6 +1362,7 @@ export const DbServiceLive = Layer.effect(
                  review_thinking_level = ?,
                  backend_model_prefs = ?,
                  merge_policy = ?,
+                 guaranteed_min_concurrent_agent_turns = ?,
                  include_all_issue_authors = ?,
                  wait_for_ready_for_review_checks = ?,
                  updated_at = ?
@@ -1284,6 +1380,7 @@ export const DbServiceLive = Layer.effect(
                   reviewThinkingLevel,
                   backendModelPrefs,
                   input.mergePolicy,
+                  nextGuaranteedMin,
                   input.includeAllIssueAuthors,
                   input.waitForReadyForReviewChecks,
                   now,
@@ -1307,7 +1404,8 @@ export const DbServiceLive = Layer.effect(
                 tag === "AgentBackendChangeBlockedError" ||
                 tag === "RepositoryIdentityChangeBlockedError" ||
                 tag === "RepositoryAlreadyExistsError" ||
-                tag === "InvalidRepositorySettingsError"
+                tag === "InvalidRepositorySettingsError" ||
+                tag === "GuaranteedMinAgentTurnsExceedsCapError"
               ) {
                 return error as
                   | RepositoryNotFoundError
@@ -1316,6 +1414,7 @@ export const DbServiceLive = Layer.effect(
                   | RepositoryIdentityChangeBlockedError
                   | RepositoryAlreadyExistsError
                   | InvalidRepositorySettingsError
+                  | GuaranteedMinAgentTurnsExceedsCapError
               }
             }
             if (isUniqueConstraint(error as SqlError)) {
