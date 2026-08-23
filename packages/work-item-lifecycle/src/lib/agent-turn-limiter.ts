@@ -1,4 +1,4 @@
-import { Context, Deferred, Duration, Effect, Ref } from "effect"
+import { Context, Duration, Effect, Option, Ref } from "effect"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
 import type {
   AgentBackendError,
@@ -14,14 +14,6 @@ import { STEP_RUN_REASON, WAITING_FOR_AGENT_TURN_MESSAGE } from "./types.js"
 
 const DEFAULT_MAX_CONCURRENT_AGENT_TURNS = 2
 const CONFIG_RECHECK_INTERVAL = Duration.millis(200)
-
-/**
- * Bucket key for Agent Turns with no ambient Step Run / Repository identity
- * (for example a call made outside a Lifecycle Step handler). All such calls
- * share one bucket, so behavior is unchanged from a single shared limiter
- * when Repository identity is unavailable.
- */
-const NO_REPOSITORY_BUCKET = "__no_current_step_run__"
 
 export interface AgentBackendService {
   readonly startTurn: (
@@ -68,152 +60,195 @@ type SavedStepRunReason = {
   readonly reasonMessage: string | null
 }
 
-/** Per-Repository Agent Turn admission bucket. */
-interface RepoTurnBucket {
-  /** Currently held permits for this Repository. */
-  readonly inFlight: number
-  /**
-   * Global sequence number recorded the last time this Repository was
-   * admitted. A never-admitted Repository keeps the default `0`, which
-   * sorts as least-recently-serviced ahead of any Repository that has ever
-   * been admitted.
-   */
-  readonly lastAdmittedSeq: number
-  /** FIFO queue of waiters currently blocked for this Repository. */
-  readonly queue: ReadonlyArray<Deferred.Deferred<void>>
-}
+/**
+ * Bucket used for calls made with no ambient Step Run context (for example
+ * direct/test calls). Grouped as a single "repository" so admission among
+ * them is unaffected by repository-aware fairness (matches prior behavior).
+ */
+const NO_REPOSITORY = "@ready-for-agent/work-item-lifecycle/no-repository"
 
-const emptyRepoTurnBucket: RepoTurnBucket = {
-  inFlight: 0,
-  lastAdmittedSeq: 0,
-  queue: [],
-}
-
-interface TurnSchedulerState {
-  readonly buckets: Readonly<Record<string, RepoTurnBucket>>
-  readonly totalInFlight: number
+/**
+ * Admission state for the repository-aware fair-share gate, extended with an
+ * optional per-repository guaranteed-minimum priority claim. `lastGranted`
+ * tracks, per repository, the sequence number of the most recent permit it
+ * was granted (absent = never granted, treated as the least-recently-serviced
+ * of all). `waiting` tracks, per repository, how many callers are currently
+ * blocked trying to acquire a permit (pending demand); a repository absent
+ * from `waiting` (or with a count of `0`) has no pending demand and is not
+ * considered when ranking who goes next. `activeByRepository` tracks, per
+ * repository, how many permits it currently holds — used only to evaluate
+ * whether `guaranteedMins` is still unmet for that repository.
+ * `guaranteedMins` is refreshed opportunistically by each waiting caller from
+ * that caller's own Repository settings (mirroring how `capacity` is kept
+ * current from Harness Config below), so it converges to the live setting for
+ * every repository with active demand without a central scheduler.
+ */
+type FairGateState = {
+  readonly capacity: number
+  readonly active: number
   readonly seq: number
+  readonly lastGranted: ReadonlyMap<string, number>
+  readonly waiting: ReadonlyMap<string, number>
+  readonly activeByRepository: ReadonlyMap<string, number>
+  readonly guaranteedMins: ReadonlyMap<string, number>
 }
 
-const emptySchedulerState: TurnSchedulerState = {
-  buckets: {},
-  totalInFlight: 0,
+const initialFairGateState = (capacity: number): FairGateState => ({
+  capacity,
+  active: 0,
   seq: 0,
-}
+  lastGranted: new Map(),
+  waiting: new Map(),
+  activeByRepository: new Map(),
+  guaranteedMins: new Map(),
+})
+
+const recencyOf = (state: FairGateState, repositoryId: string): number =>
+  state.lastGranted.get(repositoryId) ?? Number.NEGATIVE_INFINITY
+
+const activeOf = (state: FairGateState, repositoryId: string): number =>
+  state.activeByRepository.get(repositoryId) ?? 0
+
+const guaranteedMinOf = (state: FairGateState, repositoryId: string): number =>
+  state.guaranteedMins.get(repositoryId) ?? 0
+
+const setGuaranteedMin =
+  (repositoryId: string, guaranteedMin: number) =>
+  (state: FairGateState): FairGateState => {
+    if (guaranteedMinOf(state, repositoryId) === guaranteedMin) {
+      return state
+    }
+    const guaranteedMins = new Map(state.guaranteedMins)
+    guaranteedMins.set(repositoryId, guaranteedMin)
+    return { ...state, guaranteedMins }
+  }
 
 /**
- * Drop a Repository's bucket once it is fully idle (no in-flight permits,
- * no waiters), so a long-lived harness process does not accumulate one
- * permanent bucket entry per Repository ID it has ever seen. A Repository
- * that becomes active again later simply gets a fresh bucket via `enqueue`.
+ * Attempt to admit `repositoryId` for one permit. Admits immediately when
+ * capacity is free and no other repository with pending demand is more
+ * deserving; otherwise leaves the state unchanged so the caller registers as
+ * waiting and retries.
+ *
+ * A repository with an unmet guaranteed minimum (its currently-held permits
+ * below its configured `guaranteedMins` floor) is a priority claim ahead of
+ * ordinary fair-share rotation: when any contender has an unmet guarantee,
+ * only contenders with an unmet guarantee are considered for this permit;
+ * otherwise every contender is considered as before. Within whichever pool
+ * applies, the least-recently-granted contender wins, so no repository can
+ * starve another simply by having steadier demand.
  */
-const withUpdatedBucket = (
-  buckets: Readonly<Record<string, RepoTurnBucket>>,
-  repositoryId: string,
-  bucket: RepoTurnBucket,
-): Readonly<Record<string, RepoTurnBucket>> => {
-  if (bucket.inFlight > 0 || bucket.queue.length > 0) {
-    return { ...buckets, [repositoryId]: bucket }
-  }
-  const next = { ...buckets }
-  delete next[repositoryId]
-  return next
-}
-
-/**
- * Pick the Repository that should be admitted next among those with a
- * non-empty waiter queue. A Repository with an unmet guaranteed minimum
- * (in-flight permits below its configured floor) is a priority claim ahead
- * of ordinary fair-share rotation; within the priority pool (or across all
- * pending Repositories when no unmet guarantee exists) the
- * least-recently-serviced Repository is picked, so no Repository can
- * indefinitely starve another simply by having steadier demand.
- */
-const pickNextRepository = (
-  state: TurnSchedulerState,
-  guaranteedMins: Readonly<Record<string, number>>,
-): string | null => {
-  const pending = Object.entries(state.buckets).filter(
-    ([, bucket]) => bucket.queue.length > 0,
-  )
-  if (pending.length === 0) {
-    return null
-  }
-  const unmet = pending.filter(
-    ([repositoryId, bucket]) =>
-      (guaranteedMins[repositoryId] ?? 0) > bucket.inFlight,
-  )
-  const pool = unmet.length > 0 ? unmet : pending
-  let best: readonly [string, RepoTurnBucket] | null = null
-  for (const entry of pool) {
-    if (best === null || entry[1].lastAdmittedSeq < best[1].lastAdmittedSeq) {
-      best = entry
+const tryAdmit =
+  (repositoryId: string) =>
+  (state: FairGateState): [boolean, FairGateState] => {
+    if (state.active >= state.capacity) {
+      return [false, state]
     }
-  }
-  return best === null ? null : best[0]
-}
-
-/**
- * Admit as many queued waiters as global capacity allows. Pure state
- * transition; the caller is responsible for resolving the returned
- * `Deferred`s once this has been committed to the `Ref`.
- */
-const admitPending = (
-  state: TurnSchedulerState,
-  maxConcurrentAgentTurns: number,
-  guaranteedMins: Readonly<Record<string, number>>,
-): {
-  readonly next: TurnSchedulerState
-  readonly admitted: ReadonlyArray<Deferred.Deferred<void>>
-} => {
-  let current = state
-  const admitted: Deferred.Deferred<void>[] = []
-  for (;;) {
-    if (current.totalInFlight >= maxConcurrentAgentTurns) {
-      break
+    const contenders = new Set([repositoryId])
+    for (const [otherRepositoryId, count] of state.waiting) {
+      if (count > 0) {
+        contenders.add(otherRepositoryId)
+      }
     }
-    const repositoryId = pickNextRepository(current, guaranteedMins)
-    if (repositoryId === null) {
-      break
+    const isUnmet = (id: string) =>
+      guaranteedMinOf(state, id) > activeOf(state, id)
+    const unmet = new Set([...contenders].filter(isUnmet))
+    const pool = unmet.size > 0 ? unmet : contenders
+    if (!pool.has(repositoryId)) {
+      // Another repository's unmet guarantee takes priority over me.
+      return [false, state]
     }
-    const bucket = current.buckets[repositoryId] ?? emptyRepoTurnBucket
-    const [deferred, ...rest] = bucket.queue
-    if (deferred === undefined) {
-      break
+    const myRecency = recencyOf(state, repositoryId)
+    let leastRecent = myRecency
+    for (const contender of pool) {
+      leastRecent = Math.min(leastRecent, recencyOf(state, contender))
     }
-    admitted.push(deferred)
-    const seq = current.seq + 1
-    current = {
-      seq,
-      totalInFlight: current.totalInFlight + 1,
-      buckets: {
-        ...current.buckets,
-        [repositoryId]: {
-          inFlight: bucket.inFlight + 1,
-          lastAdmittedSeq: seq,
-          queue: rest,
-        },
+    if (myRecency > leastRecent) {
+      // Another repository in the same pool has gone longer without a
+      // permit; let it be considered first.
+      return [false, state]
+    }
+    const lastGranted = new Map(state.lastGranted)
+    lastGranted.set(repositoryId, state.seq + 1)
+    const activeByRepository = new Map(state.activeByRepository)
+    activeByRepository.set(repositoryId, activeOf(state, repositoryId) + 1)
+    return [
+      true,
+      {
+        ...state,
+        active: state.active + 1,
+        seq: state.seq + 1,
+        lastGranted,
+        activeByRepository,
       },
+    ]
+  }
+
+const registerWaiting =
+  (repositoryId: string) =>
+  (state: FairGateState): FairGateState => {
+    const waiting = new Map(state.waiting)
+    waiting.set(repositoryId, (waiting.get(repositoryId) ?? 0) + 1)
+    return { ...state, waiting }
+  }
+
+const unregisterWaiting =
+  (repositoryId: string) =>
+  (state: FairGateState): FairGateState => {
+    const count = state.waiting.get(repositoryId) ?? 0
+    if (count <= 0) {
+      return state
+    }
+    const waiting = new Map(state.waiting)
+    if (count <= 1) {
+      waiting.delete(repositoryId)
+    } else {
+      waiting.set(repositoryId, count - 1)
+    }
+    return { ...state, waiting }
+  }
+
+const releasePermit =
+  (repositoryId: string) =>
+  (state: FairGateState): FairGateState => {
+    const next = Math.max(0, activeOf(state, repositoryId) - 1)
+    const activeByRepository = new Map(state.activeByRepository)
+    if (next === 0) {
+      activeByRepository.delete(repositoryId)
+    } else {
+      activeByRepository.set(repositoryId, next)
+    }
+    return {
+      ...state,
+      active: Math.max(0, state.active - 1),
+      activeByRepository,
     }
   }
-  return { next: current, admitted }
-}
 
 /**
  * Cap concurrent lifecycle Agent Turn processes using the current harness
- * Config value, admitted fairly per Repository. `inspect` is not wrapped.
+ * Config value, admitting repositories fairly under contention. `inspect` is
+ * not wrapped.
  *
- * Re-reads Config on each scheduling attempt so raising the limit frees
- * capacity promptly and lowering it does not interrupt in-flight processes
- * (they finish; new acquires wait until taken drops). When more than one
- * Repository has pending demand for a freed permit, the Repository least
- * recently granted one is admitted next; a Repository with no pending demand
- * does not affect ordering for the Repositories that do. A Repository's
- * optional guaranteed-minimum concurrent Agent Turns (Repository setting
+ * Re-reads Config on each acquire attempt and resizes the gate's capacity so
+ * raising the limit frees capacity promptly and lowering it does not
+ * interrupt in-flight processes (they finish; new acquires wait until taken
+ * drops).
+ *
+ * Admission is repository-aware and fair by default: when a permit is free
+ * and more than one repository has pending demand (an ambient
+ * {@link CurrentStepRun} tagging the caller with a `repositoryId`), the
+ * repository that has gone longest without being granted a permit is
+ * admitted next. A repository with no pending demand does not affect
+ * ordering for the repositories that do, and a single repository (or no
+ * contention at all) is admitted immediately exactly as before this
+ * repository-aware admission was introduced. Calls with no ambient Step Run
+ * context are grouped into one bucket, so their relative admission order is
+ * unaffected by this fairness rule. A repository's optional
+ * guaranteed-minimum concurrent Agent Turns (Repository setting
  * `guaranteedMinConcurrentAgentTurns`) is honored as a priority claim ahead
- * of fair-share rotation while that Repository has an unmet guarantee and
+ * of fair-share rotation while that repository has an unmet guarantee and
  * pending demand — an idle, unmet guarantee never withholds capacity from
- * other Repositories.
+ * other repositories.
  *
  * While waiting for a permit, marks the ambient Step Run with
  * `waiting_for_agent_turn` so GraphQL can show **Queued** instead of
@@ -228,7 +263,9 @@ export const limitAgentTurns = (
   sql: Pick<SqlClient, "unsafe">,
 ): Effect.Effect<AgentBackendService> =>
   Effect.gen(function* () {
-    const stateRef = yield* Ref.make<TurnSchedulerState>(emptySchedulerState)
+    const gate = yield* Ref.make(
+      initialFairGateState(DEFAULT_MAX_CONCURRENT_AGENT_TURNS),
+    )
 
     const currentMax = db.getConfig.pipe(
       Effect.map((config) => Math.max(1, config.maxConcurrentAgentTurns)),
@@ -237,7 +274,7 @@ export const limitAgentTurns = (
 
     /** Live Repository guaranteed-minimum concurrent Agent Turns. Missing/null → 0 (fully fair-share). */
     const loadGuaranteedMin = (repositoryId: string): Effect.Effect<number> =>
-      repositoryId === NO_REPOSITORY_BUCKET
+      repositoryId === NO_REPOSITORY
         ? Effect.succeed(0)
         : sql
             .unsafe(
@@ -259,128 +296,6 @@ export const limitAgentTurns = (
               }),
               Effect.orElseSucceed(() => 0),
             )
-
-    /**
-     * Re-evaluate admission: read the current global cap and the guaranteed
-     * minimum of every Repository with pending demand, then admit as many
-     * queued waiters as capacity allows. Safe to call concurrently and
-     * redundantly — the state transition is atomic and a `Deferred` can only
-     * be completed once.
-     */
-    const attemptSchedule = (): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const state = yield* Ref.get(stateRef)
-        const pendingRepositoryIds = Object.entries(state.buckets)
-          .filter(([, bucket]) => bucket.queue.length > 0)
-          .map(([repositoryId]) => repositoryId)
-        if (pendingRepositoryIds.length === 0) {
-          return
-        }
-        const max = yield* currentMax
-        const guaranteedEntries = yield* Effect.forEach(
-          pendingRepositoryIds,
-          (repositoryId) =>
-            loadGuaranteedMin(repositoryId).pipe(
-              Effect.map((min) => [repositoryId, min] as const),
-            ),
-          { concurrency: "unbounded" },
-        )
-        const guaranteedMins = Object.fromEntries(guaranteedEntries)
-        // Uninterruptible: commit admission to the Ref and notify every
-        // admitted waiter's `Deferred` as one unit, so a batch is never left
-        // half-notified if this call is interrupted partway through. This is
-        // a liveness/tidiness guarantee, not the mechanism that prevents a
-        // leak on interruption — `abandonWaiter` establishes that guarantee
-        // independently by consulting the Ref's own queue membership (see
-        // below), which flips atomically with this same commit regardless of
-        // when (or by which fiber) each `Deferred` is actually resolved.
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            const admitted = yield* Ref.modify(stateRef, (current) => {
-              const result = admitPending(current, max, guaranteedMins)
-              return [result.admitted, result.next]
-            })
-            yield* Effect.forEach(
-              admitted,
-              (deferred) => Deferred.succeed(deferred, undefined),
-              { discard: true },
-            )
-          }),
-        )
-      })
-
-    const enqueue = (
-      repositoryId: string,
-      deferred: Deferred.Deferred<void>,
-    ): Effect.Effect<void> =>
-      Ref.update(stateRef, (state) => {
-        const bucket = state.buckets[repositoryId] ?? emptyRepoTurnBucket
-        return {
-          ...state,
-          buckets: {
-            ...state.buckets,
-            [repositoryId]: {
-              ...bucket,
-              queue: [...bucket.queue, deferred],
-            },
-          },
-        }
-      })
-
-    const release = (repositoryId: string): Effect.Effect<void> =>
-      Ref.update(stateRef, (state) => {
-        const bucket = state.buckets[repositoryId] ?? emptyRepoTurnBucket
-        const updated = {
-          ...bucket,
-          inFlight: Math.max(0, bucket.inFlight - 1),
-        }
-        return {
-          ...state,
-          totalInFlight: Math.max(0, state.totalInFlight - 1),
-          buckets: withUpdatedBucket(state.buckets, repositoryId, updated),
-        }
-      })
-
-    /**
-     * Cleanup for a waiter abandoned (interrupted) before `withTurnSlot`
-     * finished waiting. Atomically checks the Ref's own queue membership —
-     * the single source of truth for whether a permit was committed to this
-     * waiter — rather than that waiter's `Deferred` completion, which can
-     * momentarily lag a cross-fiber commit (another waiter's `attemptSchedule`
-     * call can commit this waiter's admission to the Ref before it gets to
-     * resolving this specific `Deferred` in its own notify loop). Still
-     * queued: dequeue it, no permit was ever granted. Already removed from
-     * the queue (whether or not its `Deferred` has been resolved yet): the
-     * scheduler already committed a permit to it, so release that permit
-     * back rather than leaking it.
-     */
-    const abandonWaiter = (
-      repositoryId: string,
-      deferred: Deferred.Deferred<void>,
-    ): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const wasStillQueued = yield* Ref.modify(stateRef, (state) => {
-          const bucket = state.buckets[repositoryId]
-          if (bucket === undefined || !bucket.queue.includes(deferred)) {
-            return [false, state]
-          }
-          const updated = {
-            ...bucket,
-            queue: bucket.queue.filter((waiter) => waiter !== deferred),
-          }
-          return [
-            true,
-            {
-              ...state,
-              buckets: withUpdatedBucket(state.buckets, repositoryId, updated),
-            },
-          ]
-        })
-        if (!wasStillQueued) {
-          yield* release(repositoryId)
-          yield* attemptSchedule()
-        }
-      })
 
     const markWaiting = (): Effect.Effect<SavedStepRunReason | null> =>
       Effect.gen(function* () {
@@ -506,54 +421,103 @@ export const limitAgentTurns = (
     ): Effect.Effect<A, E, R> =>
       Effect.gen(function* () {
         const current = yield* CurrentStepRun
-        const repositoryId = current?.repositoryId ?? NO_REPOSITORY_BUCKET
-        const deferred = yield* Deferred.make<void>()
-        yield* enqueue(repositoryId, deferred)
+        const repositoryId = current?.repositoryId ?? NO_REPOSITORY
 
         let markedWaiting = false
         let savedReason: SavedStepRunReason | null = null
+        let registeredWaiting = false
 
-        const waitForSlot = Effect.gen(function* () {
-          for (;;) {
-            if (yield* Deferred.isDone(deferred)) {
-              return
+        const cleanupWaiting = Effect.gen(function* () {
+          if (registeredWaiting) {
+            yield* Ref.update(gate, unregisterWaiting(repositoryId))
+            registeredWaiting = false
+          }
+          if (markedWaiting) {
+            yield* clearWaiting(savedReason)
+            markedWaiting = false
+            savedReason = null
+          }
+        })
+
+        // Admitting this caller and pairing its permit with a guaranteed
+        // release must never straddle an interruption boundary: an interrupt
+        // that lands between "permit taken" and "release wired up" would
+        // leak that permit for the rest of the process's life. This mirrors
+        // how Effect's own `Semaphore.withPermitsIfAvailable` couples taking
+        // a permit with registering its release inside one uninterruptible
+        // region. Only the admission attempt itself (the `Ref.modify` below)
+        // must be uninterruptible; everything else — the config re-check and
+        // the waiting bookkeeping in the loop below, and the wait-state reset
+        // (including `clearWaiting`'s best-effort SQL write) and the turn
+        // itself here — stays freely interruptible exactly as it was before
+        // repository-aware fairness, all covered by the same guaranteed
+        // release. So a Step Run that is merely queued — never admitted —
+        // can still be cancelled promptly by Pause, Interrupt Work Item, or
+        // a productive timeout even if the database is slow, and a Step Run
+        // that was just admitted keeps that same promptness through its
+        // wait-state reset.
+        const tryRunTurn: Effect.Effect<
+          Option.Option<A>,
+          E,
+          R
+        > = Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const admitted = yield* Ref.modify(gate, tryAdmit(repositoryId))
+            if (!admitted) {
+              return Option.none()
             }
-            yield* attemptSchedule()
-            if (yield* Deferred.isDone(deferred)) {
-              return
+            const result = yield* restore(
+              Effect.ensuring(
+                Effect.gen(function* () {
+                  if (registeredWaiting) {
+                    yield* Ref.update(gate, unregisterWaiting(repositoryId))
+                    registeredWaiting = false
+                  }
+                  if (markedWaiting) {
+                    yield* clearWaiting(savedReason)
+                    markedWaiting = false
+                    savedReason = null
+                  }
+                  return yield* effect
+                }),
+                Ref.update(gate, releasePermit(repositoryId)),
+              ),
+            )
+            return Option.some(result)
+          }),
+        )
+
+        const runTurn = Effect.gen(function* () {
+          for (;;) {
+            const max = yield* currentMax
+            const guaranteedMin = yield* loadGuaranteedMin(repositoryId)
+            yield* Ref.update(gate, (state) =>
+              setGuaranteedMin(
+                repositoryId,
+                guaranteedMin,
+              )({ ...state, capacity: max }),
+            )
+            const result = yield* tryRunTurn
+            if (Option.isSome(result)) {
+              return result.value
+            }
+            if (!registeredWaiting) {
+              yield* Ref.update(gate, registerWaiting(repositoryId))
+              registeredWaiting = true
             }
             if (!markedWaiting) {
               savedReason = yield* markWaiting()
               markedWaiting = true
             }
-            yield* Effect.race(
-              Deferred.await(deferred),
-              Effect.sleep(CONFIG_RECHECK_INTERVAL),
-            )
+            yield* Effect.sleep(CONFIG_RECHECK_INTERVAL)
           }
-        }).pipe(Effect.onInterrupt(() => abandonWaiter(repositoryId, deferred)))
+        })
 
-        yield* waitForSlot
-
-        // From here on the permit is granted (the Ref already reflects it as
-        // in-flight). Guard the *entire* remaining span — restoring any prior
-        // mid-run phase and then running the actual turn — with the release
-        // finalizer, so an interrupt landing anywhere in this span (including
-        // while clearing the waiting mark, before the wrapped Agent Backend
-        // call even starts) still frees the permit instead of leaking it.
-        return yield* Effect.gen(function* () {
-          if (markedWaiting) {
-            yield* clearWaiting(savedReason)
-          }
-          return yield* effect
-        }).pipe(
-          Effect.ensuring(
-            Effect.gen(function* () {
-              yield* release(repositoryId)
-              yield* attemptSchedule()
-            }),
-          ),
-        )
+        // Belt-and-braces: if this fiber is interrupted while merely waiting,
+        // the waiting bookkeeping and Step Run "waiting" marking are still
+        // cleared. A no-op once the success branch above has already reset
+        // both flags.
+        return yield* runTurn.pipe(Effect.onExit(() => cleanupWaiting))
       })
 
     return AgentBackend.of({
