@@ -271,6 +271,27 @@ Disable with:
 KEYMAXXER_ENABLED=false npx ready-for-agent@latest
 ```
 
+#### Repository credentials
+
+When Keymaxxer is enabled, Agent Turns on backends that integrate it
+resolve Forge access through a per-repository vault secret instead of raw
+ambient tokens (which are stripped from those turns' environments):
+
+- GitHub: `provider: github`, `account: <owner>/<repo>` — required when
+  Keymaxxer is enabled.
+- GitLab: `provider: gitlab`, `account: <forge-host>/<project-path>` —
+  falls back to host-authenticated `glab` when absent.
+- Azure DevOps: `provider: azure-devops`,
+  `account: <organization>/<project>` — required when Keymaxxer is
+  enabled; without one the turn fails instead of using the ambient
+  `AZURE_DEVOPS_EXT_PAT`.
+
+For Azure DevOps, create a dedicated PAT for the vault secret scoped no
+wider than Work Items (Read) — the agent only needs to read work items to
+act on your tickets. The Harness cannot inspect or enforce token scopes,
+so scoping is up to you; a narrowly scoped PAT keeps a leaked secret
+low-value.
+
 ## Command reference
 
 <!-- usage:start -->

@@ -217,7 +217,7 @@ export const AGENT_TURN_GITLAB_VAULT_METADATA_BUDGET = Duration.seconds(
 export const agentTurnAzureDevOpsVaultAccount = azureDevOpsVaultAccount
 
 /**
- * Vault metadata budget for Azure DevOps Agent Turns before ambient fallback.
+ * Vault metadata budget for Azure DevOps Agent Turns before failing closed.
  * Shared constant with harness layer (`AZURE_DEVOPS_VAULT_METADATA_BUDGET_SECONDS`).
  */
 export const AGENT_TURN_AZURE_DEVOPS_VAULT_METADATA_BUDGET = Duration.seconds(
@@ -227,13 +227,20 @@ export const AGENT_TURN_AZURE_DEVOPS_VAULT_METADATA_BUDGET = Duration.seconds(
 /**
  * Resolve Agent Turn authentication at the Forge boundary.
  *
- * GitLab and Azure DevOps are vault-first with a permissive ambient fallback:
- * when Keymaxxer MCP is effective and a per-Repository secret exists
- * (`provider: gitlab` / `azure-devops`, account per-Forge below), use
- * `keymaxxer_run`. When no secret exists — or vault metadata times out /
- * errors — ambient `GITLAB_TOKEN` / `glab` (GitLab) or `AZURE_DEVOPS_EXT_PAT`
- * (Azure DevOps) remains the fallback (unlike GitHub, which fails closed
- * without a vault secret on Keymaxxer-capable backends).
+ * GitLab is vault-first with a permissive ambient fallback: when Keymaxxer
+ * MCP is effective and a per-Repository secret exists (`provider: gitlab`,
+ * account per-Forge below), use `keymaxxer_run`. When no secret exists — or
+ * vault metadata times out / errors — ambient `GITLAB_TOKEN` / `glab` remains
+ * the fallback.
+ *
+ * GitHub and Azure DevOps fail closed on Keymaxxer-capable backends: when
+ * Keymaxxer MCP is effective but no vault secret exists (or vault metadata
+ * times out / errors), resolution fails with
+ * `AgentTurnForgeCredentialMissingError` rather than falling back to ambient
+ * credentials. Ambient auth still applies whenever the Active Agent Backend
+ * does not support KeymaxxerMcp, or Keymaxxer is disabled for the instance —
+ * for Azure DevOps that keeps `AZURE_DEVOPS_EXT_PAT` working on backends with
+ * no Keymaxxer support at all.
  */
 export const resolveAgentTurnForgeAuth = (
   repository: AgentTurnForgeRepository,
@@ -264,7 +271,6 @@ export const resolveAgentTurnForgeAuth = (
           vaultMetadataBudget:
             options?.azureDevOpsVaultMetadataBudget ??
             AGENT_TURN_AZURE_DEVOPS_VAULT_METADATA_BUDGET,
-          ambientOnVaultUnavailable: true,
         })
       case "github":
         return yield* resolveAgentTurnGitHubAuth({
