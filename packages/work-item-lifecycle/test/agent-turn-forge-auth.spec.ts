@@ -9,6 +9,7 @@ import {
 import {
   AGENT_TURN_AZURE_DEVOPS_VAULT_METADATA_BUDGET,
   AGENT_TURN_GITLAB_VAULT_METADATA_BUDGET,
+  AgentTurnForgeCredentialMissingError,
   CurrentCapturedAgentBackendId,
   CurrentStepRun,
   InvalidCapturedAgentBackendError,
@@ -339,7 +340,8 @@ describe("resolveAgentTurnForgeAuth", () => {
     ])
   })
 
-  it("falls back to ambient Azure DevOps auth when no vault secret exists", async () => {
+  it("returns ambient Azure DevOps auth when the backend lacks KeymaxxerMcp", async () => {
+    let findSecretCalled = false
     const auth = await Effect.runPromise(
       resolveAgentTurnForgeAuth({
         forge: "azure-devops",
@@ -350,52 +352,120 @@ describe("resolveAgentTurnForgeAuth", () => {
           Layer.mergeAll(
             Layer.succeed(KeymaxxerService, {
               initialize: Effect.void,
-              hasSecret: () => Effect.succeed(false),
-              findSecret: () => Effect.succeed(null),
+              hasSecret: () => Effect.succeed(true),
+              findSecret: () => {
+                findSecretCalled = true
+                return Effect.succeed("AZURE_DEVOPS_TOKEN_ACME_WIDGETS")
+              },
               findSecrets: () => Effect.succeed([]),
               addSecret: () => Effect.succeed(true),
               runWithSecrets: () =>
                 Effect.succeed({ exitCode: 0, stdout: "", stderr: "" }),
             } satisfies KeymaxxerServiceShape),
-            stubActiveAgentBackendLayer(),
+            stubGrokActiveAgentBackendLayer,
           ),
         ),
       ),
     )
     expect(auth).toEqual({ _tag: "ambient" })
+    expect(findSecretCalled).toBe(false)
   })
 
-  it("falls back to ambient Azure DevOps auth when vault findSecret hangs past budget", async () => {
+  it("fails closed when no Azure DevOps vault secret exists", async () => {
+    const error = await Effect.runPromise(
+      Effect.flip(
+        resolveAgentTurnForgeAuth({
+          forge: "azure-devops",
+          forgeHost: "dev.azure.com",
+          projectPath: "acme/widgets",
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(KeymaxxerService, {
+                initialize: Effect.void,
+                hasSecret: () => Effect.succeed(false),
+                findSecret: () => Effect.succeed(null),
+                findSecrets: () => Effect.succeed([]),
+                addSecret: () => Effect.succeed(true),
+                runWithSecrets: () =>
+                  Effect.succeed({ exitCode: 0, stdout: "", stderr: "" }),
+              } satisfies KeymaxxerServiceShape),
+              stubActiveAgentBackendLayer(),
+            ),
+          ),
+        ),
+      ),
+    )
+    expect(error).toBeInstanceOf(AgentTurnForgeCredentialMissingError)
+    if (error instanceof AgentTurnForgeCredentialMissingError) {
+      expect(error.message).toBe(
+        "No Azure DevOps credential is configured for acme/widgets",
+      )
+    }
+  })
+
+  it("fails closed when Azure DevOps vault findSecret errors", async () => {
+    const error = await Effect.runPromise(
+      Effect.flip(
+        resolveAgentTurnForgeAuth({
+          forge: "azure-devops",
+          forgeHost: "dev.azure.com",
+          projectPath: "acme/widgets",
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(KeymaxxerService, {
+                initialize: Effect.void,
+                hasSecret: () => Effect.succeed(true),
+                findSecret: () =>
+                  Effect.fail(keymaxxerError("findSecret", "sidecar down")),
+                findSecrets: () => Effect.succeed([]),
+                addSecret: () => Effect.succeed(true),
+                runWithSecrets: () =>
+                  Effect.succeed({ exitCode: 0, stdout: "", stderr: "" }),
+              } satisfies KeymaxxerServiceShape),
+              stubActiveAgentBackendLayer(),
+            ),
+          ),
+        ),
+      ),
+    )
+    expect(error).toBeInstanceOf(AgentTurnForgeCredentialMissingError)
+  })
+
+  it("fails closed when the Azure DevOps vault hangs past budget", async () => {
     expect(
       Duration.toMillis(AGENT_TURN_AZURE_DEVOPS_VAULT_METADATA_BUDGET),
     ).toBe(AZURE_DEVOPS_VAULT_METADATA_BUDGET_SECONDS * 1000)
     const started = Date.now()
-    const auth = await Effect.runPromise(
-      resolveAgentTurnForgeAuth(
-        {
-          forge: "azure-devops",
-          forgeHost: "dev.azure.com",
-          projectPath: "acme/widgets",
-        },
-        { azureDevOpsVaultMetadataBudget: Duration.millis(40) },
-      ).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            Layer.succeed(KeymaxxerService, {
-              initialize: Effect.void,
-              hasSecret: () => Effect.succeed(true),
-              findSecret: () => Effect.never,
-              findSecrets: () => Effect.succeed([]),
-              addSecret: () => Effect.succeed(true),
-              runWithSecrets: () =>
-                Effect.succeed({ exitCode: 0, stdout: "", stderr: "" }),
-            } satisfies KeymaxxerServiceShape),
-            stubActiveAgentBackendLayer(),
+    const error = await Effect.runPromise(
+      Effect.flip(
+        resolveAgentTurnForgeAuth(
+          {
+            forge: "azure-devops",
+            forgeHost: "dev.azure.com",
+            projectPath: "acme/widgets",
+          },
+          { azureDevOpsVaultMetadataBudget: Duration.millis(40) },
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(KeymaxxerService, {
+                initialize: Effect.void,
+                hasSecret: () => Effect.succeed(true),
+                findSecret: () => Effect.never,
+                findSecrets: () => Effect.succeed([]),
+                addSecret: () => Effect.succeed(true),
+                runWithSecrets: () =>
+                  Effect.succeed({ exitCode: 0, stdout: "", stderr: "" }),
+              } satisfies KeymaxxerServiceShape),
+              stubActiveAgentBackendLayer(),
+            ),
           ),
         ),
       ),
     )
-    expect(auth).toEqual({ _tag: "ambient" })
+    expect(error).toBeInstanceOf(AgentTurnForgeCredentialMissingError)
     expect(Date.now() - started).toBeLessThan(2_000)
   })
 })

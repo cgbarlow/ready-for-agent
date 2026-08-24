@@ -67,6 +67,7 @@ export const makeOpencodeEnvironment = Effect.fn("makeOpencodeEnvironment")(
       ...sanitizeInheritedEnvironment(environment, {
         stripGitHubTokens: vaultMcpConfigured,
         stripGitLabTokens: vaultMcpConfigured,
+        stripAzureDevOpsTokens: vaultMcpConfigured,
       }),
       OPENCODE_CONFIG_CONTENT: JSON.stringify(opencodeConfig),
     }

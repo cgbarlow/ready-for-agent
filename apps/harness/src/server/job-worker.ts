@@ -60,6 +60,17 @@ const REFRESH_REPOSITORY_TAG = "refresh-repository"
 const CREDENTIAL_CHECK_CONCURRENCY = 4
 
 /**
+ * Raised by {@link runPollingAutoHeal} when at least one Repository's
+ * credential check failed, so the Auto-heal Job still retries (with
+ * backoff) for that Repository even though every other Repository's
+ * schedule was already repaired in the same pass.
+ */
+class AutoHealCredentialCheckFailedError extends Schema.TaggedErrorClass<AutoHealCredentialCheckFailedError>()(
+  "AutoHealCredentialCheckFailedError",
+  { failedRepositoryIds: Schema.Array(Schema.String) },
+) {}
+
+/**
  * Process-local consecutive failure counts for scheduled Issue polls.
  * `postponeKeyed` resets queue `job_attempts`, so recurrence failure is
  * unobservable through the queue; this Map is the only consecutive-failure
@@ -156,25 +167,73 @@ const repositoryHasCredential = Effect.fn("JobWorker.repositoryHasCredential")(
   },
 )
 
+/**
+ * A credential-check failure for one Repository (e.g. an unreachable
+ * Keymaxxer vault) must not prevent every other Repository's Auto-heal from
+ * completing — `Effect.filter`'s fail-fast semantics would otherwise let one
+ * Repository's broken credential source wedge polling repair for
+ * Repositories on unrelated Forges entirely. Each check is isolated with
+ * `Effect.forEach` instead, and a failed check is reported back rather than
+ * silently swallowed, so {@link runPollingAutoHeal} can still schedule every
+ * Repository whose check succeeded *and* signal the job should retry (with
+ * backoff) for whichever Repository's check failed. See
+ * ready-for-agent#48/#49.
+ */
 const listCredentialedRepositoryIds = Effect.gen(function* () {
   const db = yield* DbService
   const repositories = yield* db.listRepositories
-  const credentialed = yield* Effect.filter(
+  const results = yield* Effect.forEach(
     repositories,
-    repositoryHasCredential,
+    (repository) =>
+      repositoryHasCredential(repository).pipe(
+        Effect.map((credentialed) => ({
+          repositoryId: repository.id,
+          credentialed,
+          failed: false,
+        })),
+        Effect.catch((error) =>
+          Effect.logWarning(
+            "Repository credential check failed; excluding from this Auto-heal pass",
+            {
+              repositoryId: repository.id,
+              forge: repository.forge,
+              ...logErrorAnnotations(error),
+            },
+          ).pipe(
+            Effect.as({
+              repositoryId: repository.id,
+              credentialed: false,
+              failed: true,
+            }),
+          ),
+        ),
+      ),
     { concurrency: CREDENTIAL_CHECK_CONCURRENCY },
   )
-  return credentialed.map((repository) => repository.id)
+  return {
+    credentialedRepositoryIds: results
+      .filter((result) => result.credentialed)
+      .map((result) => result.repositoryId),
+    failedRepositoryIds: results
+      .filter((result) => result.failed)
+      .map((result) => result.repositoryId),
+  }
 })
 
 const runPollingAutoHeal = Effect.fn("JobWorker.runPollingAutoHeal")(function* (
   sampleDelay: Effect.Effect<Duration.Duration>,
 ) {
-  const credentialedRepositoryIds = yield* listCredentialedRepositoryIds
+  const { credentialedRepositoryIds, failedRepositoryIds } =
+    yield* listCredentialedRepositoryIds
   yield* repairPollingSchedules({
     credentialedRepositoryIds,
     sampleDelay,
   })
+  if (failedRepositoryIds.length > 0) {
+    return yield* new AutoHealCredentialCheckFailedError({
+      failedRepositoryIds,
+    })
+  }
 })
 
 export interface JobWorkerOptions {

@@ -3117,6 +3117,158 @@ describe("Job worker", () => {
   )
 
   it.live(
+    "a Repository whose credential check fails outright does not block Auto-heal from repairing other Repositories",
+    () =>
+      Effect.gen(function* () {
+        const database = DbServiceLive.pipe(Layer.provideMerge(DatabaseTest))
+        const queue = SqliteQueueServiceLive.pipe(Layer.provideMerge(database))
+        const azureRepository = makeRepositoryRecord({
+          id: RepositoryId.make("repo-01J00000000000000000000002"),
+          forge: "azure-devops",
+          forgeHost: "dev.azure.com",
+          projectPath: "org/project/repo",
+          localPath: "/repos/org/project/repo",
+        })
+        // Simulates a persistently unreachable Keymaxxer vault (e.g. "no
+        // vault found") — a definite failure, not the transient kind the
+        // "retries with backoff" test covers.
+        const brokenKeymaxxer = Layer.succeed(KeymaxxerService, {
+          initialize: Effect.void,
+          findSecret: () =>
+            new KeymaxxerError({
+              operation: "findSecret",
+              message: "no vault found",
+            }),
+          findSecrets: () => Effect.die("not used"),
+          hasSecret: () => Effect.die("not used"),
+          addSecret: () => Effect.die("not used"),
+          runWithSecrets: () => Effect.die("not used"),
+        })
+        const lifecycle = Layer.succeed(WorkItemLifecycle, {
+          maxDurations: {
+            create_worktree: Duration.minutes(5),
+            install_dependencies: Duration.minutes(15),
+            implement: Duration.hours(2),
+            assess_changes: Duration.minutes(5),
+            pre_commit: Duration.hours(2),
+            review: Duration.hours(1),
+            commit: Duration.minutes(5),
+            create_pr: Duration.minutes(10),
+            watch_pr_status_checks: Duration.minutes(5),
+            resolve_pr_merge_conflict: Duration.hours(2),
+            investigate_pr_status_checks: Duration.hours(2),
+            mark_pr_ready_for_review: Duration.minutes(5),
+            decide_pr_merge: Duration.minutes(15),
+            merge_pr: Duration.minutes(5),
+            close_issue: Duration.minutes(5),
+            local_cleanup: Duration.minutes(5),
+          },
+          implementNow: unused,
+          implementWith: unused,
+          implementLocally: unused,
+          implementAllWithAutoMerge: unused,
+          queue: unused,
+          recoverOrphanedStepRuns: Effect.succeed(0),
+          interruptRunningStepRunsFromPriorWorker: Effect.succeed(0),
+          runStep: () => Effect.succeed({ _tag: "noop" as const }),
+          wakePostponedStep: () => Effect.succeed({ _tag: "stale" as const }),
+          retry: unused,
+          pause: unused,
+          interrupt: unused,
+          start: unused,
+          abandon: unused,
+          reset: unused,
+          getWorkItem: unused,
+          listWorkItemsForIssue: unused,
+          listWorkItemsForRepository: () => Effect.succeed([]),
+          listCompletedWorkItems: () =>
+            Effect.succeed({ items: [], page: 1, pageSize: 20, totalCount: 0 }),
+          ownsSessionId: () => Effect.succeed(false),
+          findWorkItemBySessionId: unused,
+          countCommittedPullRequests: () => Effect.succeed(0),
+          continueAfterHumanPrOutcome: unused,
+          stopForCompetingIssueClosingPullRequests: () => Effect.succeed(0),
+          admitWaitingWorkItems: Effect.succeed(0),
+          releaseWaitingForBlockers: () => Effect.succeed(0),
+        })
+
+        yield* Effect.gen(function* () {
+          const db = yield* DbService
+          const service = yield* QueueService
+          const uncredentialedGithub = yield* db.addRepository({
+            forge: repository.forge,
+            forgeHost: repository.forgeHost,
+            projectPath: repository.projectPath,
+            localPath: repository.localPath,
+            isBare: true,
+          })
+          const credentialedAzure = yield* db.addRepository({
+            forge: azureRepository.forge,
+            forgeHost: azureRepository.forgeHost,
+            projectPath: azureRepository.projectPath,
+            localPath: azureRepository.localPath,
+            isBare: true,
+          })
+
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* startJobWorker({
+                idlePollInterval: Duration.zero,
+                samplePollingDelay: Effect.succeed(Duration.seconds(120)),
+              })
+              // Azure DevOps must be scheduled promptly despite the GitHub
+              // Repository's credential check always failing — its failure
+              // must not block this Repository's own repair.
+              while ((yield* service.listKeyed(ISSUE_POLL_QUEUE)).length < 1) {
+                yield* Effect.sleep("5 millis")
+              }
+            }),
+          )
+
+          const schedules = yield* service.listKeyed(ISSUE_POLL_QUEUE)
+          // Only the independently-credentialed Azure DevOps Repository is
+          // scheduled — the broken GitHub Repository is excluded, not
+          // permitted to block the whole Auto-heal pass.
+          expect(schedules.map((entry) => entry.key)).toEqual([
+            credentialedAzure.id,
+          ])
+          // The Auto-heal Job itself keeps retrying (with backoff) rather
+          // than being silently acknowledged as done — the still-broken
+          // GitHub Repository must get another chance once its credential
+          // source recovers.
+          const autoHeal = yield* service.listKeyed(ISSUE_REFRESH_QUEUE)
+          expect(
+            autoHeal.filter((entry) => entry.key === POLLING_AUTO_HEAL_KEY),
+          ).toHaveLength(1)
+          void uncredentialedGithub
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              defaultGithubLayer,
+              defaultAzureDevOpsLayer,
+              database,
+              queue,
+              Layer.succeed(IssueReconciler, {
+                reconcile: () =>
+                  Effect.succeed({
+                    fetched: 0,
+                    inserted: 0,
+                    updated: 0,
+                    deleted: 0,
+                    unchanged: 0,
+                    competingObservations: [],
+                  }),
+              }),
+              brokenKeymaxxer,
+              lifecycle,
+            ),
+          ),
+          Effect.orDie,
+        )
+      }),
+  )
+
+  it.live(
     "successful auto-heal does not disturb queued manual Refresh Jobs",
     () =>
       Effect.gen(function* () {
