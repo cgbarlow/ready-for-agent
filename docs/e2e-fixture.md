@@ -237,7 +237,7 @@ the fixture vault with repository secret `E2E_KEYMAXXER_MASTER_KEY`.
 | Event | Secret available | Policy |
 | --- | --- | --- |
 | `push` to `main` | required | Fail closed if missing |
-| Same-repo PR | required on live-Forge | Fail closed if missing on `harness-e2e-live-forge`; UI-history and `@no-backend` still run |
+| Same-repo PR | optional on live-Forge | Skip live-Forge e2e when `E2E_KEYMAXXER_MASTER_KEY` is absent (log + continue), same as fork PRs; UI-history and `@no-backend` still run |
 | Fork PR | no (secrets not exposed) | Skip live-Forge e2e only (log + continue); UI-history still runs smoke, vault-free `e2e-no-backend`, and `e2e-ui-history`; quality-gates and pinact still run |
 
 Required status checks (after the former monolithic `main` job was split, then
