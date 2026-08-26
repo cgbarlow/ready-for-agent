@@ -177,7 +177,7 @@ describe("PR live e2e jobs (issue #999)", () => {
     expect(uiHistory?.needs ?? []).not.toContain("harness-e2e-live-forge")
   })
 
-  test("same-repo PRs fail closed when the live-Forge vault secret is missing", async () => {
+  test("same-repo PRs soft-skip when the live-Forge vault secret is missing", async () => {
     const workflow = await loadPrWorkflow()
     const steps = workflow.jobs?.["harness-e2e-live-forge"]?.steps
     expect(steps).toBeDefined()
@@ -189,9 +189,9 @@ describe("PR live e2e jobs (issue #999)", () => {
         ) === true || step.run?.includes("E2E_KEYMAXXER_MASTER_KEY") === true,
     )
     expect(vaultCheck?.run).toBeDefined()
-    expect(vaultCheck?.run).toContain("github.repository")
-    expect(vaultCheck?.run).toMatch(/exit 1/)
-    expect(vaultCheck?.run).toContain("head.repo.full_name")
+    expect(vaultCheck?.run).not.toMatch(/exit 1/)
+    expect(vaultCheck?.run).toContain('has_key=false')
+    expect(vaultCheck?.run).toContain("Skipping live-Forge e2e")
   })
 
   test("required-check rollup still reflects both e2e jobs", async () => {

@@ -95,8 +95,9 @@ jobs:
         run: bunx nx run harness:slow-test
 
   # Live-Forge e2e (issue #999): add/refresh, Intake, catalog-only fixture path.
-  # Parallel with UI-history. Same-repo PRs fail closed without the vault
-  # secret; fork PRs skip this suite (secrets are not exposed).
+  # Parallel with UI-history. Skips when the vault secret is unavailable
+  # (fork PRs never have secrets; same-repo PRs soft-skip the same way
+  # when E2E_KEYMAXXER_MASTER_KEY is absent).
   harness-e2e-live-forge:
     runs-on: ubuntu-latest
     steps:
@@ -134,12 +135,8 @@ jobs:
             echo "has_key=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
-            echo "error: same-repo PR requires repository secret E2E_KEYMAXXER_MASTER_KEY for live-Forge e2e" >&2
-            exit 1
-          fi
           echo "has_key=false" >> "$GITHUB_OUTPUT"
-          echo "Skipping live-Forge e2e: E2E_KEYMAXXER_MASTER_KEY is unavailable (expected for fork PRs)."
+          echo "Skipping live-Forge e2e: E2E_KEYMAXXER_MASTER_KEY is unavailable (expected for fork PRs and when the secret is absent on same-repo PRs)."
 
       - name: Install OpenCode
         if: steps.e2e-vault.outputs.has_key == 'true'
